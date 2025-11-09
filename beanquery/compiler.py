@@ -18,6 +18,7 @@ from .query_compile import (
     EvalAnd,
     EvalAll,
     EvalAny,
+    EvalCase,
     EvalCoalesce,
     EvalColumn,
     EvalConstant,
@@ -759,6 +760,44 @@ class Compiler:
             if node.value in self.table.columns:
                 return self._column(ast.Column(node.value))
         return EvalConstant(node.value)
+
+    @_compile.register
+    def _case(self, node: ast.Case):
+        # Compile all WHEN clauses
+        when_clauses = [
+            (self._compile(when_clause.condition), self._compile(when_clause.result))
+            for when_clause in node.when_clauses
+        ]
+
+        # Compile ELSE clause if present
+        else_expr = self._compile(node.else_expr) if node.else_expr is not None else None
+
+        results = [result for _, result in when_clauses]
+        if else_expr is not None:
+            results.append(else_expr)
+
+        if not results:
+            raise CompilationError('CASE expression must have at least one WHEN clause', node)
+
+        # Resolve a common result type across all branches, coercing each
+        # branch result so that the declared dtype matches what is actually
+        # returned at runtime.
+        result_dtype, coerced_results, error = self._try_coerce_to_common_type(results)
+        if error is not None:
+            source_dtype, target_dtype, i = error
+            raise CompilationError(
+                f'CASE expression has incompatible types: '
+                f'{types.name(source_dtype)} and {types.name(target_dtype)} at position {i}',
+                node)
+
+        when_clauses = [
+            (condition, coerced_result)
+            for (condition, _), coerced_result in zip(when_clauses, coerced_results)
+        ]
+        if else_expr is not None:
+            else_expr = coerced_results[-1]
+
+        return EvalCase(when_clauses, else_expr, result_dtype)
 
     @_compile.register
     def _placeholder(self, node: ast.Placeholder):

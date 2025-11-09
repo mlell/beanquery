@@ -25,34 +25,37 @@ from tatsu.util import re, generic_main
 
 
 KEYWORDS: set[str] = {
-    'USING',
-    'GROUP',
-    'INSERT',
-    'AND',
-    'WHERE',
-    'SELECT',
-    'FROM',
     'DISTINCT',
-    'BALANCES',
-    'ORDER',
-    'PRINT',
-    'DESC',
-    'INTO',
-    'IN',
-    'CREATE',
-    'OR',
-    'BY',
-    'LIMIT',
-    'FALSE',
-    'AS',
-    'HAVING',
-    'ASC',
-    'IS',
-    'TABLE',
-    'NOT',
-    'TRUE',
     'PIVOT',
+    'INTO',
+    'BALANCES',
+    'USING',
+    'DESC',
+    'AND',
+    'BY',
+    'INSERT',
+    'WHEN',
+    'TABLE',
+    'CASE',
+    'IS',
+    'FALSE',
+    'ORDER',
+    'OR',
+    'FROM',
+    'THEN',
+    'NOT',
+    'SELECT',
+    'PRINT',
+    'IN',
+    'WHERE',
+    'ASC',
+    'GROUP',
+    'TRUE',
+    'AS',
+    'LIMIT',
+    'CREATE',
     'JOURNAL',
+    'HAVING',
 }
 
 
@@ -909,9 +912,10 @@ class BQLParser(Parser):
                 self._atom_()
             self._error(
                 'expecting one of: '
-                "'SELECT' <atom> <attribute> <column>"
-                '<constant> <function> <placeholder>'
-                '<primary> <select> <subscript>'
+                "'SELECT' <atom> <attribute> <case_expr>"
+                '<column> <constant> <function>'
+                '<placeholder> <primary> <select>'
+                '<subscript>'
             )
 
     @tatsumasu('Attribute')
@@ -939,6 +943,8 @@ class BQLParser(Parser):
     def _atom_(self):
         with self._choice():
             with self._option():
+                self._case_expr_()
+            with self._option():
                 self._select_()
             with self._option():
                 self._function_()
@@ -950,11 +956,41 @@ class BQLParser(Parser):
                 self._placeholder_()
             self._error(
                 'expecting one of: '
-                "'%(' '%s' 'SELECT' <boolean> <column>"
-                '<constant> <date> <decimal> <function>'
-                '<identifier> <integer> <list> <literal>'
-                '<null> <placeholder> <select> <string>'
+                "'%(' '%s' 'CASE' 'SELECT' <boolean>"
+                '<case_expr> <column> <constant> <date>'
+                '<decimal> <function> <identifier>'
+                '<integer> <list> <literal> <null>'
+                '<placeholder> <select> <string>'
             )
+
+    @tatsumasu('WhenClause')
+    def _when_clause_(self):
+        self._token('WHEN')
+        self._expression_()
+        self.name_last_node('condition')
+        self._token('THEN')
+        self._expression_()
+        self.name_last_node('result')
+        self._define(['condition', 'result'], [])
+
+    @tatsumasu('Case')
+    def _case_expr_(self):
+        self._token('CASE')
+
+        def block0():
+            self._when_clause_()
+            self.add_last_node_to_name('when_clauses')
+        self._positive_closure(block0)
+        with self._optional():
+            self._token('ELSE')
+            self._expression_()
+            self.name_last_node('else_expr')
+            self._define(['else_expr'], [])
+        self._token('END')
+        self._define(
+            ['else_expr'],
+            ['when_clauses'],
+        )
 
     @tatsumasu('Placeholder')
     def _placeholder_(self):
