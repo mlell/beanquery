@@ -684,8 +684,11 @@ def date_part(field, x):
 
 @function([str], relativedelta)
 def interval(x):
-    """Construct a relative time interval."""
-    m = re.fullmatch(r'([-+]?[0-9]+)\s+(day|month|year)s?', x)
+    """Construct a relative time interval. Example argument: '2 weeks'.
+    Further options are day, month, year, century, millenium (plural s can be
+    appended). Use to modify dates: `date + interval(...)`"""
+    x = x.lower()
+    m = re.fullmatch(r'([-+]?[0-9]+)\s+([a-z]+?)s?', x)
     if not m:
         return None
     number = int(m.group(1))
@@ -702,7 +705,7 @@ def interval(x):
         return relativedelta(years=number * 10)
     if unit == 'century':
         return relativedelta(years=number * 100)
-    if unit == 'millennium':
+    if unit in ['millennium', 'millenia']:
         return relativedelta(years=number * 1000)
     return None
 
