@@ -159,9 +159,25 @@ class From(Node):
 # A GROUP BY clause.
 #
 # Attributes:
-#   columns: A list of group-by expressions, simple Column() or otherwise.
+#   elements: An ordered list of grouping-element nodes (GroupColumn or
+#     GroupingSets).
 #   having: An expression tree for the optional HAVING clause, or None.
-GroupBy = node('GroupBy', 'columns having')
+GroupBy = node('GroupBy', 'elements having')
+
+# A plain column/expression/integer in a GROUP BY element list.
+#
+# Attributes:
+#   column: A column/expression node or a 1-based integer index.
+GroupColumn = node('GroupColumn', 'column')
+
+# A GROUPING SETS (...) element in a GROUP BY clause.
+#
+# Each set is a (possibly empty) list of column/expression/integer items.
+# An empty list represents the grand-total set.
+#
+# Attributes:
+#   sets: A list of lists; each inner list is one grouping set.
+GroupingSets = node('GroupingSets', 'sets')
 
 # An ORDER BY clause.
 #

@@ -508,7 +508,7 @@ class Compiler:
         having_index = None
 
         if group_by:
-            assert group_by.columns, "Internal error with GROUP-BY parsing"
+            assert group_by.elements, "Internal error with GROUP-BY parsing"
 
             # Compile group-by expressions and resolve them to their targets if
             # possible. A GROUP-BY column may be one of the following:
@@ -520,7 +520,13 @@ class Compiler:
             # References by name are converted to indexes. New expressions are
             # inserted into the list of targets as invisible targets.
             targets_name_map = {target.name: index for index, target in enumerate(c_targets)}
-            for column in group_by.columns:
+            for element in group_by.elements:
+                if isinstance(element, ast.GroupingSets):
+                    raise NotImplementedError(
+                        f'unexpected grouping element type {type(element).__name__}; '
+                        'GROUPING SETS desugaring is not yet implemented'
+                    )
+                column = element.column
                 index = None
 
                 # Process target references by index.

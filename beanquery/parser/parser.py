@@ -25,34 +25,36 @@ from tatsu.util import re, generic_main
 
 
 KEYWORDS: set[str] = {
-    'CREATE',
-    'AS',
-    'TABLE',
     'PRINT',
+    'IN',
     'PIVOT',
-    'USING',
+    'INSERT',
+    'FALSE',
+    'DESC',
+    'AS',
+    'INTO',
+    'DISTINCT',
+    'TABLE',
+    'FROM',
+    'WHERE',
     'ASC',
     'JOURNAL',
-    'FROM',
-    'AND',
-    'DESC',
-    'BALANCES',
-    'INSERT',
-    'HAVING',
-    'FALSE',
-    'SELECT',
     'ORDER',
-    'NOT',
-    'INTO',
-    'IN',
-    'LIMIT',
+    'GROUPING',
+    'CREATE',
     'IS',
-    'BY',
+    'USING',
     'OR',
+    'LIMIT',
     'TRUE',
-    'WHERE',
+    'AND',
+    'SELECT',
+    'HAVING',
+    'BY',
     'GROUP',
-    'DISTINCT',
+    'NOT',
+    'SETS',
+    'BALANCES',
 }
 
 
@@ -401,6 +403,68 @@ class BQLParser(Parser):
             self._token(',')
 
         def block1():
+            self._grouping_element_()
+        self._positive_gather(block1, sep0)
+        self.name_last_node('elements')
+        with self._optional():
+            self._token('HAVING')
+            self._expression_()
+            self.name_last_node('having')
+            self._define(['having'], [])
+        self._define(['elements', 'having'], [])
+
+    @tatsumasu()
+    def _grouping_element_(self):
+        with self._choice():
+            with self._option():
+                self._grouping_sets_()
+            with self._option():
+                self._group_column_()
+            self._error(
+                'expecting one of: '
+                "'GROUPING' <expression> <group_column>"
+                '<grouping_sets> <integer>'
+            )
+
+    @tatsumasu('GroupColumn')
+    def _group_column_(self):
+        with self._group():
+            with self._choice():
+                with self._option():
+                    self._integer_()
+                with self._option():
+                    self._expression_()
+                self._error(
+                    'expecting one of: '
+                    '<conjunction> <disjunction> <expression>'
+                    '<integer> [0-9]+'
+                )
+        self.name_last_node('column')
+
+    @tatsumasu('GroupingSets')
+    def _grouping_sets_(self):
+        self._token('GROUPING')
+        self._token('SETS')
+        self._token('(')
+
+        def sep0():
+            self._token(',')
+
+        def block1():
+            self._grouping_set_()
+        self._gather(block1, sep0)
+        self.name_last_node('sets')
+        self._token(')')
+        self._define(['sets'], [])
+
+    @tatsumasu()
+    def _grouping_set_(self):
+        self._token('(')
+
+        def sep0():
+            self._token(',')
+
+        def block1():
             with self._group():
                 with self._choice():
                     with self._option():
@@ -411,14 +475,9 @@ class BQLParser(Parser):
                         'expecting one of: '
                         '<expression> <integer>'
                     )
-        self._positive_gather(block1, sep0)
-        self.name_last_node('columns')
-        with self._optional():
-            self._token('HAVING')
-            self._expression_()
-            self.name_last_node('having')
-            self._define(['having'], [])
-        self._define(['columns', 'having'], [])
+        self._gather(block1, sep0)
+        self.name_last_node('@')
+        self._token(')')
 
     @tatsumasu('OrderBy')
     def _order_(self):

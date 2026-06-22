@@ -9,6 +9,9 @@ from decimal import Decimal as D
 from beanquery import parser
 from beanquery.parser import ast
 
+GC = ast.GroupColumn
+GS = ast.GroupingSets
+
 
 def Select(targets, from_clause=None, where_clause=None, **kwargs):
     defaults = dict(targets=targets,
@@ -321,33 +324,33 @@ class TestSelectGroupBy(QueryParserTestBase):
         self.assertParse(
             "SELECT * GROUP BY a;",
             Select(ast.Asterisk(),
-                   group_by=ast.GroupBy([ast.Column('a')], None)))
+                   group_by=ast.GroupBy([GC(ast.Column('a'))], None)))
 
     def test_groupby_many(self):
         self.assertParse(
             "SELECT * GROUP BY a, b, c;",
             Select(ast.Asterisk(),
                    group_by=ast.GroupBy([
-                       ast.Column('a'),
-                       ast.Column('b'),
-                       ast.Column('c')], None)))
+                       GC(ast.Column('a')),
+                       GC(ast.Column('b')),
+                       GC(ast.Column('c'))], None)))
 
     def test_groupby_expr(self):
         self.assertParse(
             "SELECT * GROUP BY length(a) > 0, b;",
             Select(ast.Asterisk(),
                    group_by=ast.GroupBy([
-                       ast.Greater(
+                       GC(ast.Greater(
                            ast.Function('length', [
                                ast.Column('a')]),
-                           ast.Constant(0)),
-                       ast.Column('b')], None)))
+                           ast.Constant(0))),
+                       GC(ast.Column('b'))], None)))
 
     def test_groupby_having(self):
         self.assertParse(
             "SELECT * GROUP BY a HAVING sum(x) = 0;",
             Select(ast.Asterisk(),
-                   group_by=ast.GroupBy([ast.Column('a')],
+                   group_by=ast.GroupBy([GC(ast.Column('a'))],
                         ast.Equal(
                             ast.Function('sum', [
                                 ast.Column('x')]),
@@ -357,16 +360,65 @@ class TestSelectGroupBy(QueryParserTestBase):
         self.assertParse(
             "SELECT * GROUP BY 1;",
             Select(ast.Asterisk(),
-                   group_by=ast.GroupBy([1], None)))
+                   group_by=ast.GroupBy([GC(1)], None)))
 
         self.assertParse(
             "SELECT * GROUP BY 2, 4, 5;",
             Select(ast.Asterisk(),
-                   group_by=ast.GroupBy([2, 4, 5], None)))
+                   group_by=ast.GroupBy([GC(2), GC(4), GC(5)], None)))
 
     def test_groupby_empty(self):
         with self.assertRaises(parser.ParseError):
             parser.parse("SELECT * GROUP BY;")
+
+    def test_groupby_grouping_sets_single(self):
+        self.assertParse(
+            "SELECT * GROUP BY GROUPING SETS ((a));",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [GS([[ast.Column('a')]])], None)))
+
+    def test_groupby_grouping_sets_multiple(self):
+        self.assertParse(
+            "SELECT * GROUP BY GROUPING SETS ((a, b), (a), ());",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [GS([
+                           [ast.Column('a'), ast.Column('b')],
+                           [ast.Column('a')],
+                           []])], None)))
+
+    def test_groupby_grouping_sets_empty_set(self):
+        self.assertParse(
+            "SELECT * GROUP BY GROUPING SETS (());",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy([GS([[]])], None)))
+
+    def test_groupby_grouping_sets_having(self):
+        self.assertParse(
+            "SELECT * GROUP BY GROUPING SETS ((a)) HAVING sum(x) > 0;",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [GS([[ast.Column('a')]])],
+                       ast.Greater(
+                           ast.Function('sum', [ast.Column('x')]),
+                           ast.Constant(0)))))
+
+    def test_groupby_mixed_plain_and_grouping_sets(self):
+        self.assertParse(
+            "SELECT * GROUP BY a, GROUPING SETS ((b), (c));",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [GC(ast.Column('a')),
+                        GS([[ast.Column('b')], [ast.Column('c')]])], None)))
+
+    def test_groupby_two_grouping_sets_elements(self):
+        self.assertParse(
+            "SELECT * GROUP BY GROUPING SETS ((a)), GROUPING SETS ((b), ());",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [GS([[ast.Column('a')]]),
+                        GS([[ast.Column('b')], []])], None)))
 
 
 class TestSelectOrderBy(QueryParserTestBase):
