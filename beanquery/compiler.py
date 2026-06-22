@@ -271,9 +271,17 @@ class Compiler:
         if c_from_expr is not None:
             c_where = c_from_expr if c_where is None else EvalAnd([c_from_expr, c_where])
 
-        # Process the GROUP-BY clause.
-        new_targets, group_indexes, having_index = self._compile_group_by(node.group_by, c_targets)
+        # Process the GROUP-BY clause.  _compile_group_by returns grouping_sets
+        # in set-list form ([[idx, ...], ...]) or None for non-aggregate queries.
+        new_targets, grouping_sets, having_index = self._compile_group_by(node.group_by, c_targets)
         c_targets.extend(new_targets)
+
+        # Temprorary guard: desugaring multiple grouping sets into EvalUnion is
+        # not yet implemented.  A single set is unwrapped to the flat
+        # group_indexes expected by EvalSelect and query_execute.py.
+        if grouping_sets is not None and len(grouping_sets) > 1:
+            raise NotImplementedError('GROUPING SETS not yet implemented')
+        group_indexes = grouping_sets[0] if grouping_sets is not None else None
 
         # ORDER BY and LIMIT are compiled by the enclosing _query handler,
         # which also validates aggregate coverage after ORDER BY targets are added.
@@ -494,46 +502,69 @@ class Compiler:
           c_targets: A list of compiled target expressions.
         Returns:
           A tuple of
-           new_targets: A list of new compiled target nodes.
-           group_indexes: If the query is an aggregate query, a list of integer
-             indexes to be used for processing grouping. Note that this list may be
-             empty (in the case of targets with only aggregates). On the other hand,
-             if this is not an aggregated query, this is set to None. So do
-             distinguish the empty list vs. None.
+           new_targets: A list of new target nodes added beyond c_targets.
+           grouping_sets: For aggregate queries, a list of index-sets in set-list
+             form: each inner list is one grouping set (the group_indexes for one
+             SELECT operand).  A plain GROUP BY or a single-set GROUPING SETS
+             yields exactly one inner list.  An aggregate query that groups by
+             nothing is [[]] (one empty set).  For non-aggregate queries this is
+             None.  The None vs. non-None distinction is significant and consumed
+             by _select / query_execute.py.
+           having_index: Index of the HAVING target in the extended target list,
+             or None when there is no HAVING clause.
         """
         new_targets = c_targets[:]
         c_target_expressions = [c_target.c_expr for c_target in c_targets]
 
-        group_indexes = []
         having_index = None
 
         if group_by:
             assert group_by.elements, "Internal error with GROUP-BY parsing"
 
-            # Compile group-by expressions and resolve them to their targets if
-            # possible. A GROUP-BY column may be one of the following:
-            #
-            # * A reference to a target by name.
-            # * A reference to a target by index (starting at one).
-            # * A new, non-aggregate expression.
-            #
-            # References by name are converted to indexes. New expressions are
-            # inserted into the list of targets as invisible targets.
-            targets_name_map = {target.name: index for index, target in enumerate(c_targets)}
-            for element in group_by.elements:
-                if isinstance(element, ast.GroupingSets):
-                    raise NotImplementedError(
-                        f'unexpected grouping element type {type(element).__name__}; '
-                        'GROUPING SETS desugaring is not yet implemented'
-                    )
-                column = element.column
-                # We have a simple GROUP BY element (just a column/expression,
-                # no GROUPING SETS
-                index = self._compile_group_by_simple_element(
-                    column, c_targets, new_targets, c_target_expressions, targets_name_map)
-                group_indexes.append(index)
+            # Determine whether any element is a complex grouping construct
+            # (GROUPING SETS).  Plain GROUP BY keeps the hidden-target fallback;
+            # complex GROUP BY forbids it so every union operand shares an
+            # identical column structure.
+            is_complex = any(isinstance(e, ast.GroupingSets) for e in group_by.elements)
 
-            # Compile HAVING clause.
+            targets_name_map = {target.name: index for index, target in enumerate(c_targets)}
+
+            # Each element expands to a list of index-sets:
+            #   plain GroupColumn  -> [[idx]]
+            #   GroupingSets       -> [[...], [...], ...] (one per set)
+            element_set_lists = []
+            for element in group_by.elements:
+                if isinstance(element, ast.GroupColumn):
+                    idx = self._compile_group_by_simple_element(
+                        element.column, c_targets, new_targets,
+                        c_target_expressions, targets_name_map,
+                        strict=is_complex,
+                    )
+                    element_set_lists.append([[idx]])
+
+                elif isinstance(element, ast.GroupingSets):
+                    sets_for_element = []
+                    for one_set in element.sets:
+                        resolved_set = [
+                            self._compile_group_by_simple_element(
+                                col, c_targets, new_targets,
+                                c_target_expressions, targets_name_map,
+                                strict=True,
+                            )
+                            for col in one_set
+                        ]
+                        sets_for_element.append(resolved_set)
+                    element_set_lists.append(sets_for_element)
+
+                else:
+                    raise CompilationError(
+                        f'unexpected grouping element type {type(element).__name__}'
+                    )
+
+            # Combine all per-element set-lists via cartesian product.
+            grouping_sets = _combine_grouping_sets(element_set_lists)
+
+            # Compile HAVING clause (identical across all union operands).
             if group_by.having is not None:
                 c_expr = self._compile(group_by.having)
                 if not is_aggregate(c_expr):
@@ -549,33 +580,35 @@ class Compiler:
                 # If the query is an aggregate query, check that all the targets are
                 # aggregates.
                 if all(aggregate_bools):
-                    # FIXME: shold we really be checking for the empty
-                    # list or is checking for a false value enough?
-                    assert group_indexes == []
+                    grouping_sets = [[]]
                 elif SUPPORT_IMPLICIT_GROUPBY:
                     # If some of the targets aren't aggregates, automatically infer
                     # that they are to be implicit group by targets. This makes for
                     # a much more convenient syntax for our lightweight SQL, where
                     # grouping is optional.
-                    group_indexes = [
+                    grouping_sets = [[
                         index for index, c_target in enumerate(c_targets)
-                        if not c_target.is_aggregate]
+                        if not c_target.is_aggregate]]
                 else:
                     raise CompilationError('aggregate query without a GROUP-BY should have only aggregates')
             else:
-                # This is not an aggregate query; don't set group_indexes to
+                # This is not an aggregate query; don't set grouping_sets to
                 # anything useful, we won't need it.
-                group_indexes = None
+                grouping_sets = None
 
-        return new_targets[len(c_targets):], group_indexes, having_index
+        return new_targets[len(c_targets):], grouping_sets, having_index
 
-    def _compile_group_by_simple_element(self, column, c_targets, new_targets, c_target_expressions, targets_name_map):
+    def _compile_group_by_simple_element(
+        self, column, c_targets, new_targets, c_target_expressions,
+        targets_name_map, strict=False
+    ):
         """Compile a single GROUP-BY element (non-GROUPING SETS).
 
         Resolves a GROUP-BY column reference to a target index. The column may be:
         - An integer index (1-based) referencing a target position
         - A Column name referencing an existing target
         - A new expression to be compiled and added as an invisible target
+          (only allowed when strict=False)
 
         Args:
           column: The column reference (int, ast.Column, or other expression node)
@@ -583,6 +616,9 @@ class Compiler:
           new_targets: Mutable list of compiled targets (may be extended with new expressions)
           c_target_expressions: Mutable list of compiled expressions (parallel to new_targets)
           targets_name_map: Dict mapping target names to their indexes in c_targets
+          strict: When True, a column that does not resolve to an existing visible
+            target raises CompilationError instead of creating an invisible target.
+            Required for GROUPING SETS so every operand shares the same column structure.
 
         Returns:
           index: Integer index into new_targets for this GROUP-BY column
@@ -617,7 +653,15 @@ class Compiler:
                 # target expressions.
                 try:
                     index = c_target_expressions.index(c_expr)
-                except ValueError:
+                except ValueError as e:
+                    # In strict mode (GROUPING SETS) every GROUP BY column must
+                    # resolve to a visible target so all union operands share the
+                    # same column structure.
+                    if strict:
+                        raise CompilationError(
+                            f'GROUP-BY column "{column}" is not in the SELECT list; '
+                            'hidden targets are not allowed inside GROUPING SETS'
+                        ) from e
                     # Add the new target. 'None' for the target name implies it
                     # should be invisible, not to be rendered.
                     index = len(new_targets)
@@ -991,6 +1035,38 @@ class Compiler:
                 raise CompilationError(f'expression has wrong type for column "{column.name}"', value)
             values[index] = expr
         return EvalInsert(table, values)
+
+
+def _combine_grouping_sets(element_set_lists):
+    """Compute the cartesian product of per-element grouping-set lists.
+
+    Each GROUP BY element expands to a list of index-sets:
+    - A plain GroupColumn expands to [[idx]] (one set containing one index).
+    - A GroupingSets element expands to its list of index lists.
+
+    The final grouping sets are the cartesian product: each combination picks
+    one index-set from each element and concatenates the member lists.
+
+    Args:
+      element_set_lists: A list of lists of lists of int.  One outer entry per
+        GROUP BY element, each entry being the list of index-sets for that element.
+
+    Returns:
+      A list of lists of int, each inner list being the group_indexes for one
+      union operand.  An aggregate query that groups by nothing is represented
+      as [[]] (one set, empty), *not* None (which means non-aggregate).
+
+    >>> _combine_grouping_sets([[[0]], [[1, 2]]])
+    [[0, 1, 2]]
+    >>> _combine_grouping_sets([[[0]], [[1], []]])
+    [[0, 1], [0]]
+    >>> _combine_grouping_sets([[[]]])
+    [[]]
+    """
+    result = [[]]  # identity for cartesian product
+    for element_sets in element_set_lists:
+        result = [existing + one_set for existing in result for one_set in element_sets]
+    return result
 
 
 def transform_journal(journal):

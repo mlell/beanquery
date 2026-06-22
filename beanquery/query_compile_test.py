@@ -12,6 +12,7 @@ import beanquery
 
 from beanquery import Connection, CompilationError, ProgrammingError
 from beanquery import compiler
+from beanquery.compiler import _combine_grouping_sets
 from beanquery import query_compile as qc
 from beanquery import query_env as qe
 from beanquery import parser
@@ -476,6 +477,126 @@ class TestCompileSelectGroupBy(CompileSelectBase):
           GROUP BY account, length(account);
         """)
         self.assertEqual([0, 1], query.select.group_indexes)
+
+
+class TestCombineGroupingSets(unittest.TestCase):
+
+    def test_single_plain_column(self):
+        # A single plain GroupColumn yields one set with its index.
+        self.assertEqual([[2]], _combine_grouping_sets([[[2]]]))
+
+    def test_two_plain_columns(self):
+        # Two plain columns combine into one set via cartesian product.
+        self.assertEqual([[0, 1]], _combine_grouping_sets([[[0]], [[1]]]))
+
+    def test_plain_column_prefixes_grouping_sets(self):
+        # A plain column [[0]] prefixes each set in GROUPING SETS ((1), ()).
+        self.assertEqual([[0, 1], [0]], _combine_grouping_sets([[[0]], [[1], []]]))
+
+    def test_two_grouping_sets_elements(self):
+        # Cartesian product of two GROUPING SETS elements.
+        result = _combine_grouping_sets([[[0], [1]], [[2], []]])
+        self.assertEqual([[0, 2], [0], [1, 2], [1]], result)
+
+    def test_empty_set_identity(self):
+        # An empty grouping set [[]] acts as the identity — no indexes added.
+        self.assertEqual([[]], _combine_grouping_sets([[[]]])),
+
+    def test_multi_index_set(self):
+        # A set with multiple indexes is kept as a unit.
+        self.assertEqual([[0, 1, 2]], _combine_grouping_sets([[[0]], [[1, 2]]]))
+
+
+class TestCompileSelectGroupingSets(CompileSelectBase):
+
+    def test_single_grouping_set_resolves_by_name(self):
+        # A GROUPING SETS column resolved by target name produces a single
+        # set — equivalent to a plain GROUP BY and flattens to group_indexes.
+        query = self.compile("""
+          SELECT account, sum(number)
+          GROUP BY GROUPING SETS ((account));
+        """)
+        self.assertEqual([0], query.select.group_indexes)
+
+    def test_single_grouping_set_resolves_by_index(self):
+        query = self.compile("""
+          SELECT account, sum(number)
+          GROUP BY GROUPING SETS ((1));
+        """)
+        self.assertEqual([0], query.select.group_indexes)
+
+    def test_single_grouping_set_resolves_by_expression(self):
+        # An expression in the grouping set that matches a SELECT expression
+        # (not just by name/index) resolves to the existing target.
+        query = self.compile("""
+          SELECT year(date), sum(number)
+          GROUP BY GROUPING SETS ((year(date)));
+        """)
+        self.assertEqual([0], query.select.group_indexes)
+
+    def test_grouping_sets_forbids_hidden_target(self):
+        # A column not in SELECT raises CompilationError in strict mode.
+        with self.assertRaises(CompilationError) as ctx:
+            self.compile("""
+              SELECT sum(number)
+              GROUP BY GROUPING SETS ((account));
+            """)
+        self.assertIn('hidden targets are not allowed inside GROUPING SETS',
+                      str(ctx.exception))
+
+    def test_mixed_plain_forbids_hidden_target(self):
+        # A plain column in a mixed GROUP BY (with GROUPING SETS present) is
+        # also subject to the strict no-hidden-target rule.
+        with self.assertRaises(CompilationError) as ctx:
+            self.compile("""
+              SELECT account, sum(number)
+              GROUP BY date, GROUPING SETS ((account));
+            """)
+        self.assertIn('hidden targets are not allowed inside GROUPING SETS',
+                      str(ctx.exception))
+
+    def test_single_set_flattens_to_group_indexes(self):
+        # When the cartesian product yields exactly one set, it flattens
+        # to a plain group_indexes list — same as a plain GROUP BY.
+        query = self.compile("""
+          SELECT account, date, sum(number)
+          GROUP BY GROUPING SETS ((account, date));
+        """)
+        self.assertEqual([0, 1], query.select.group_indexes)
+
+    def test_empty_grouping_set_yields_empty_group_indexes(self):
+        # GROUPING SETS (()) is one set with no columns — all-aggregate row.
+        query = self.compile("""
+          SELECT sum(number)
+          GROUP BY GROUPING SETS (());
+        """)
+        self.assertEqual([], query.select.group_indexes)
+
+    def test_multi_set_raises_not_implemented(self):
+        # Multiple grouping sets hit the Phase 2 guard.
+        with self.assertRaises(NotImplementedError):
+            self.compile("""
+              SELECT account, sum(number)
+              GROUP BY GROUPING SETS ((account), ());
+            """)
+
+    def test_mixed_plain_plus_grouping_sets_multi_raises(self):
+        # A plain column combined with GROUPING SETS with >1 set also raises.
+        with self.assertRaises(NotImplementedError):
+            self.compile("""
+              SELECT account, date, sum(number)
+              GROUP BY account, GROUPING SETS ((date), ());
+            """)
+
+    def test_having_with_single_grouping_set(self):
+        # HAVING compiles normally alongside a single GROUPING SETS.
+        query = self.compile("""
+          SELECT account, sum(number)
+          GROUP BY GROUPING SETS ((account))
+          HAVING sum(number) > 0;
+        """)
+        self.assertEqual([0], query.select.group_indexes)
+        self.assertIsNotNone(query.select.having_index)
 
 
 class TestCompileSelectOrderBy(CompileSelectBase):
