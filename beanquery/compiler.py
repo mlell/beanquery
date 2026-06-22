@@ -527,54 +527,11 @@ class Compiler:
                         'GROUPING SETS desugaring is not yet implemented'
                     )
                 column = element.column
-                index = None
-
-                # Process target references by index.
-                if isinstance(column, int):
-                    index = column - 1
-                    if not 0 <= index < len(c_targets):
-                        raise CompilationError(f'invalid GROUP-BY column index {column}')
-
-                else:
-                    # Process target references by name. These will be parsed as
-                    # simple Column expressions. If they refer to a target name, we
-                    # resolve them.
-                    if isinstance(column, ast.Column):
-                        name = column.name
-                        index = targets_name_map.get(name, None)
-
-                    # Otherwise we compile the expression and add it to the list of
-                    # targets to evaluate and index into that new target.
-                    if index is None:
-                        c_expr = self._compile(column)
-
-                        # Check if the new expression is an aggregate.
-                        aggregate = is_aggregate(c_expr)
-                        if aggregate:
-                            raise CompilationError(f'GROUP-BY expressions may not be aggregates: "{column}"')
-
-                        # Attempt to reconcile the expression with one of the existing
-                        # target expressions.
-                        try:
-                            index = c_target_expressions.index(c_expr)
-                        except ValueError:
-                            # Add the new target. 'None' for the target name implies it
-                            # should be invisible, not to be rendered.
-                            index = len(new_targets)
-                            new_targets.append(EvalTarget(c_expr, None, aggregate))
-                            c_target_expressions.append(c_expr)
-
-                assert index is not None, "Internal error, could not index group-by reference."
+                # We have a simple GROUP BY element (just a column/expression,
+                # no GROUPING SETS
+                index = self._compile_group_by_simple_element(
+                    column, c_targets, new_targets, c_target_expressions, targets_name_map)
                 group_indexes.append(index)
-
-                # Check that the group-by column references a non-aggregate.
-                c_expr = new_targets[index].c_expr
-                if is_aggregate(c_expr):
-                    raise CompilationError(f'GROUP-BY expressions may not reference aggregates: "{column}"')
-
-                # Check that the group-by column has a supported hashable type.
-                if not issubclass(c_expr.dtype, collections.abc.Hashable):
-                    raise CompilationError(f'GROUP-BY a non-hashable type is not supported: "{column}"')
 
             # Compile HAVING clause.
             if group_by.having is not None:
@@ -611,6 +568,74 @@ class Compiler:
                 group_indexes = None
 
         return new_targets[len(c_targets):], group_indexes, having_index
+
+    def _compile_group_by_simple_element(self, column, c_targets, new_targets, c_target_expressions, targets_name_map):
+        """Compile a single GROUP-BY element (non-GROUPING SETS).
+
+        Resolves a GROUP-BY column reference to a target index. The column may be:
+        - An integer index (1-based) referencing a target position
+        - A Column name referencing an existing target
+        - A new expression to be compiled and added as an invisible target
+
+        Args:
+          column: The column reference (int, ast.Column, or other expression node)
+          c_targets: Original list of compiled targets (for length checks)
+          new_targets: Mutable list of compiled targets (may be extended with new expressions)
+          c_target_expressions: Mutable list of compiled expressions (parallel to new_targets)
+          targets_name_map: Dict mapping target names to their indexes in c_targets
+
+        Returns:
+          index: Integer index into new_targets for this GROUP-BY column
+        """
+        index = None
+
+        # Process target references by index.
+        if isinstance(column, int):
+            index = column - 1
+            if not 0 <= index < len(c_targets):
+                raise CompilationError(f'invalid GROUP-BY column index {column}')
+
+        else:
+            # Process target references by name. These will be parsed as
+            # simple Column expressions. If they refer to a target name, we
+            # resolve them.
+            if isinstance(column, ast.Column):
+                name = column.name
+                index = targets_name_map.get(name, None)
+
+            # Otherwise we compile the expression and add it to the list of
+            # targets to evaluate and index into that new target.
+            if index is None:
+                c_expr = self._compile(column)
+
+                # Check if the new expression is an aggregate.
+                aggregate = is_aggregate(c_expr)
+                if aggregate:
+                    raise CompilationError(f'GROUP-BY expressions may not be aggregates: "{column}"')
+
+                # Attempt to reconcile the expression with one of the existing
+                # target expressions.
+                try:
+                    index = c_target_expressions.index(c_expr)
+                except ValueError:
+                    # Add the new target. 'None' for the target name implies it
+                    # should be invisible, not to be rendered.
+                    index = len(new_targets)
+                    new_targets.append(EvalTarget(c_expr, None, aggregate))
+                    c_target_expressions.append(c_expr)
+
+        assert index is not None, "Internal error, could not index group-by reference."
+
+        # Check that the group-by column references a non-aggregate.
+        c_expr = new_targets[index].c_expr
+        if is_aggregate(c_expr):
+            raise CompilationError(f'GROUP-BY expressions may not reference aggregates: "{column}"')
+
+        # Check that the group-by column has a supported hashable type.
+        if not issubclass(c_expr.dtype, collections.abc.Hashable):
+            raise CompilationError(f'GROUP-BY a non-hashable type is not supported: "{column}"')
+
+        return index
 
     @_compile.register
     def _column(self, node: ast.Column):
