@@ -789,7 +789,7 @@ class TestExecuteNonAggregatedQuery(QueryBase):
                 ])
 
 
-class TestExecuteAggregatedQuery(QueryBase):
+class TestExecuteSimpleAggregatedQuery(QueryBase):
 
     INPUT = """
 
@@ -1111,6 +1111,203 @@ class TestExecuteAggregatedQuery(QueryBase):
             [
                 ('Expenses:Bar', D(2.0)),
                 ('Expenses:Foo', D(1.0)),
+            ])
+
+
+class TestExecuteGroupingSets(QueryBase):
+
+    # 3 accounts × 2 years gives enough variety to check NULL markers,
+    # subtotals, and grand totals without being unwieldy.
+    INPUT = """
+      2020-01-01 open Assets:Cash
+      2020-01-01 open Expenses:Food
+      2020-01-01 open Expenses:Transport
+
+      2020-03-01 * "Food 2020 No 1"
+        Expenses:Food         5.00 USD
+        Assets:Cash
+
+      2020-03-01 * "Food 2020 No 2"
+        Expenses:Food         5.00 USD
+        Assets:Cash
+
+      2020-06-01 * "Transport 2020 No 1"
+        Expenses:Transport   10.00 USD
+        Assets:Cash
+
+      2020-06-01 * "Transport 2020 No 2"
+        Expenses:Transport   10.00 USD
+        Assets:Cash
+
+      2021-03-01 * "Food 2021 No 1"
+        Expenses:Food        15.00 USD
+        Assets:Cash
+
+      2021-03-01 * "Food 2021 No 2"
+        Expenses:Food        15.00 USD
+        Assets:Cash
+
+      2021-06-01 * "Transport 2021 No 1"
+        Expenses:Transport   20.00 USD
+        Assets:Cash
+
+      2021-06-01 * "Transport 2021 No 2"
+        Expenses:Transport   20.00 USD
+        Assets:Cash
+    """
+
+    def test_grouping_sets_single_column(self):
+        # Single GROUPING SETS on account: each set groups by one column,
+        # NULL appears in the other column's position in the complementary set.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ())
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                ('Expenses:Food',  D('40.00')),
+                ('Expenses:Transport', D('60.00')),
+                (None,             D('100.00')),
+            ])
+
+    def test_grouping_sets_two_columns(self):
+        # Two-column grouping sets: (account, year) and (account) and ().
+        # NULL markers appear for the absent grouping column in each row.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account, yr), (account))
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+            ])
+
+    def test_grouping_sets_empty_set_grand_total(self):
+        # An empty grouping set () produces the grand-total row (all NULLs
+        # for non-aggregate columns).
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ())
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                ('Expenses:Food',      D('40.00')),
+                ('Expenses:Transport', D('60.00')),
+                (None,                 D('100.00')),
+            ])
+
+    def test_grouping_sets_mixed_plain_prefix(self):
+        # Plain column prefix combined with GROUPING SETS: the prefix column
+        # is grouped in every set, the GROUPING SETS column varies.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY account, GROUPING SETS ((yr), ())
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+            ])
+
+    def test_grouping_sets_two_grouping_sets_elements(self):
+        # Two GROUPING SETS elements: cartesian product produces 2×2 = 4 sets.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ()),
+                     GROUPING SETS ((yr), ())            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+                (None,                 2020, D('30.00')),
+                (None,                 2021, D('70.00')),
+                (None,                 None, D('100.00')),
+            ])
+
+    def test_grouping_sets_with_order_by_and_limit(self):
+        # ORDER BY and LIMIT apply to the combined UNION ALL result.
+        # Grand-total row (account=NULL, total=100.00) sorts first DESC.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ())
+            ORDER BY total DESC
+            LIMIT 2
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                (None,                 D('100.00')),
+                ('Expenses:Transport', D('60.00')),
+            ])
+
+    def test_grouping_sets_with_having(self):
+        # HAVING filters within each set independently.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ())
+            HAVING sum(number) > 50.00
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                ('Expenses:Transport', D('60.00')),
+                (None,                 D('100.00')),
+            ])
+
+    def test_grouping_sets_with_pivot_by(self):
+        # PIVOT BY requires its second column to be in the intersection of all
+        # per-set group indexes.  Sets (account, yr) and (yr) have intersection
+        # {yr}, so PIVOT BY account, yr is valid (yr is the second column).
+        # Rows grouped only by yr (account=NULL) provide the column-total cells.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account, yr), (yr))
+            PIVOT BY account, yr
+            """,
+            [
+                ('account/yr', str),
+                ('2020', Decimal),
+                ('2021', Decimal),
+            ],
+            [
+                (None,                 D('30.00'), D('70.00')),
+                ('Expenses:Food',      D('10.00'), D('30.00')),
+                ('Expenses:Transport', D('20.00'), D('40.00')),
             ])
 
 
