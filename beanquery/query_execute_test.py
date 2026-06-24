@@ -1116,7 +1116,7 @@ class TestExecuteSimpleAggregatedQuery(QueryBase):
 
 class TestExecuteGroupingSets(QueryBase):
 
-    # 3 accounts × 2 years gives enough variety to check NULL markers,
+    # 3 accounts * 2 years gives enough variety to check NULL markers,
     # subtotals, and grand totals without being unwieldy.
     INPUT = """
       2020-01-01 open Assets:Cash
@@ -1231,7 +1231,7 @@ class TestExecuteGroupingSets(QueryBase):
             ])
 
     def test_grouping_sets_two_grouping_sets_elements(self):
-        # Two GROUPING SETS elements: cartesian product produces 2×2 = 4 sets.
+        # Two GROUPING SETS elements: cartesian product produces 2*2 = 4 sets.
         self.check_query(
             self.INPUT,
             """
@@ -1464,6 +1464,63 @@ class TestExecuteGroupingSets(QueryBase):
                 (None, D('40.00'), D('60.00'), D('100.00')),
                 (2020, D('10.00'), D('20.00'), None),
                 (2021, D('30.00'), D('40.00'), None),
+            ])
+
+    def test_cube_two_columns(self):
+        # CUBE(a, b) desugars to GROUPING SETS((a, b), (a), (b), ())
+        # Creates all 2^2 = 4 combinations
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY CUBE (account, yr)
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+                (None,                 2020, D('30.00')),
+                (None,                 2021, D('70.00')),
+                (None,                 None, D('100.00')),
+            ])
+
+    def test_cube_three_columns(self):
+        # CUBE(a, b, c) desugars to GROUPING SETS with all 2^3 = 8 combinations
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, month(date) AS mo, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY CUBE (account, yr, mo)
+            """,
+            [('account', str), ('yr', int), ('mo', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, 3,  D('10.00')),
+                ('Expenses:Transport', 2020, 6,  D('20.00')),
+                ('Expenses:Food',      2021, 3,  D('30.00')),
+                ('Expenses:Transport', 2021, 6,  D('40.00')),
+                ('Expenses:Food',      2020, None, D('10.00')),
+                ('Expenses:Transport', 2020, None, D('20.00')),
+                ('Expenses:Food',      2021, None, D('30.00')),
+                ('Expenses:Transport', 2021, None, D('40.00')),
+                ('Expenses:Food',      None, 3,  D('40.00')),
+                ('Expenses:Transport', None, 6,  D('60.00')),
+                (None,                 2020, 3,  D('10.00')),
+                (None,                 2020, 6,  D('20.00')),
+                (None,                 2021, 3,  D('30.00')),
+                (None,                 2021, 6,  D('40.00')),
+                ('Expenses:Food',      None, None, D('40.00')),
+                ('Expenses:Transport', None, None, D('60.00')),
+                (None,                 2020, None, D('30.00')),
+                (None,                 2021, None, D('70.00')),
+                (None,                 None, 3,  D('40.00')),
+                (None,                 None, 6,  D('60.00')),
+                (None,                 None, None, D('100.00')),
             ])
 
 

@@ -12,6 +12,7 @@ from beanquery.parser import ast
 GC = ast.GroupColumn
 GS = ast.GroupingSets
 RU = ast.Rollup
+CU = ast.Cube
 
 
 def Select(targets, from_clause=None, where_clause=None, **kwargs):
@@ -452,6 +453,13 @@ class TestSelectGroupBy(QueryParserTestBase):
                    group_by=ast.GroupBy(
                        [GC(ast.Column('a')),
                         RU([ast.Column('b'), ast.Column('c')])], None)))
+
+    def test_groupby_cube_multiple(self):
+        self.assertParse(
+            "SELECT * GROUP BY CUBE (a, b, c);",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [CU([ast.Column('a'), ast.Column('b'), ast.Column('c')])], None)))
 
 
 class TestSelectOrderBy(QueryParserTestBase):

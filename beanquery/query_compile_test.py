@@ -619,13 +619,13 @@ class TestCompileSelectGroupingSets(CompileSelectBase):
         # GROUP BY GROUPING SETS((a)), ROLLUP(b)
         # Element 1: GROUPING SETS((a)) -> [[a]]
         # Element 2: ROLLUP(b) -> [[b], []]
-        # 
+        #
         # SQL standard (cross-product of elements):
-        #   [[a]] × [[b], []] = [[a, b], [a]]
+        #   [[a]] x [[b], []] = [[a, b], [a]]
         #   Produces 2 union operands
         #
         # Full cartesian of all sets (NOT SQL standard):
-        #   [[a]] × [[b], []] = [[a, b], [a], [a]] (duplicate [a] from empty set)
+        #   [[a]] x [[b], []] = [[a, b], [a], [a]] (duplicate [a] from empty set)
         #   Would produce 3 union operands
         query = self.compile("""
           SELECT account, year(date) AS yr, sum(number)

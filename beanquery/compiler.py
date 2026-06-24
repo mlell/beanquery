@@ -3,6 +3,7 @@ import importlib
 import typing
 
 from decimal import Decimal
+from itertools import combinations
 from functools import singledispatchmethod
 from os import path
 from typing import Optional, Sequence, Mapping, Union
@@ -565,8 +566,8 @@ class Compiler:
 
         Resolve and validate columns references in the PIVOT BY clause.
         The PIVOT BY clause accepts two name or index references to columns in
-        the SELECT targets list.  When grouping_sets is provided (GROUPING SETS)
-        , validates that the pivot column never appears in a
+        the SELECT targets list.  When grouping_sets is provided (GROUPING SETS/
+        ROLLUP/CUBE), validates that the pivot column never appears in a
         grouping set without the row column — which would let two rows share the
         same pivot key without a unique row identity.  For plain GROUP BY, falls
         back to checking membership in group_indexes.
@@ -642,10 +643,10 @@ class Compiler:
             assert group_by.elements, "Internal error with GROUP-BY parsing"
 
             # Determine whether any element is a complex grouping construct
-            # (GROUPING SETS or ROLLUP).  Plain GROUP BY keeps the hidden-target fallback;
+            # (GROUPING SETS, ROLLUP, or CUBE).  Plain GROUP BY keeps the hidden-target fallback;
             # complex GROUP BY forbids it so every union operand shares an
             # identical column structure.
-            complex_elements = (ast.GroupingSets, ast.Rollup)
+            complex_elements = (ast.GroupingSets, ast.Rollup, ast.Cube)
             is_complex = any(isinstance(e, complex_elements) for e in group_by.elements)
 
             targets_name_map = {target.name: index for index, target in enumerate(c_targets)}
@@ -654,6 +655,7 @@ class Compiler:
             #   plain GroupColumn  -> [[idx]]
             #   GroupingSets       -> [[...], [...], ...] (one per set)
             #   Rollup             -> [[i1, i2], [i1], []] (hierarchical)
+            #   Cube               -> [[i1, i2], [i1], [i2], []] (power set, 2^N combinations)
             element_set_lists = []
             for element in group_by.elements:
                 if isinstance(element, ast.GroupColumn):
@@ -693,6 +695,24 @@ class Compiler:
                     sets_for_element = []
                     for i in range(len(resolved_columns), -1, -1):
                         sets_for_element.append(resolved_columns[:i] if i > 0 else [])
+                    element_set_lists.append(sets_for_element)
+
+                elif isinstance(element, ast.Cube):
+                    # CUBE(a, b, c) desugars to GROUPING SETS with all 2^N combinations
+                    # Resolve all columns to indices first
+                    resolved_columns = [
+                        self._compile_group_by_simple_element(
+                            col, c_targets, new_targets,
+                            c_target_expressions, targets_name_map,
+                            strict=True,
+                        )
+                        for col in element.columns
+                    ]
+                    # Generate power set (all 2^N combinations)
+                    sets_for_element = []
+                    for i in range(len(resolved_columns), -1, -1):
+                        for combo in combinations(resolved_columns, i):
+                            sets_for_element.append(list(combo))
                     element_set_lists.append(sets_for_element)
 
                 else:

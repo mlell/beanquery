@@ -188,6 +188,15 @@ GroupingSets = node('GroupingSets', 'sets')
 #   columns: A list of column/expression/integer items.
 Rollup = node('Rollup', 'columns')
 
+# A CUBE (...) element in a GROUP BY clause.
+#
+# CUBE(a, b, c) is equivalent to GROUPING SETS((a, b, c), (a, b), (a, c), (b, c), (a), (b), (c), ()).
+# It creates all 2^N combinations of the columns (power set).
+#
+# Attributes:
+#   columns: A list of column/expression/integer items.
+Cube = node('Cube', 'columns')
+
 # An ORDER BY clause.
 #
 # Attributes:

@@ -3,7 +3,7 @@
 @@ignorecase :: True
 @@keyword :: 'AND' 'AS' 'ASC' 'BY' 'DESC' 'DISTINCT' 'FALSE' 'FROM'
     'GROUP' 'GROUPING' 'HAVING' 'IN' 'IS' 'LIMIT' 'NOT' 'OR' 'ORDER' 'PIVOT'
-    'ROLLUP' 'SELECT' 'SETS' 'TRUE' 'WHERE'
+    'ROLLUP' 'CUBE' 'SELECT' 'SETS' 'TRUE' 'WHERE'
 @@keyword :: 'CREATE' 'TABLE' 'USING' 'INSERT' 'INTO'
 @@keyword :: 'BALANCES' 'JOURNAL' 'PRINT'
 @@comments :: /(\/\*([^*]|[\r\n]|(\*+([^*\/]|[\r\n])))*\*+\/)/
@@ -75,11 +75,12 @@ groupby::GroupBy
     = elements:','.{ grouping_element }+ ['HAVING' having:expression]
     ;
 
-(* A simple column or an expression like GROUPING SETS(...) or ROLLUP(...) *)
+(* A simple column or an expression like GROUPING SETS(...), ROLLUP(...) or CUBE(...) *)
 grouping_element
     =
     | grouping_sets
     | rollup
+    | cube
     | group_column
     ;
 
@@ -96,6 +97,11 @@ grouping_sets::GroupingSets
 (* A ROLLUP(...) element *)
 rollup::Rollup
     = 'ROLLUP' '(' columns:','.{ (integer | expression) } ')'
+    ;
+
+(* A CUBE(...) element *)
+cube::Cube
+    = 'CUBE' '(' columns:','.{ (integer | expression) } ')'
     ;
 
 grouping_set
