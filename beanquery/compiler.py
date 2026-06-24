@@ -22,6 +22,7 @@ from .query_compile import (
     EvalColumn,
     EvalConstant,
     EvalCreateTable,
+    EvalGroupingSets,
     EvalUnion,
     EvalGetItem,
     EvalGetter,
@@ -177,10 +178,18 @@ class Compiler:
         )
 
         # --- PIVOT BY ---
-        # PIVOT BY requires group_indexes, which only EvalSelect exposes.
-        if node.pivot_by is not None and isinstance(inner, EvalUnion):
+        # EvalGroupingSets carries raw per-operand grouping_sets and supports
+        # PIVOT BY with per-set validation.  A bare EvalUnion from an explicit
+        # UNION query has no grouping metadata and is rejected.
+        if node.pivot_by is not None and isinstance(inner, EvalUnion) and not isinstance(inner, EvalGroupingSets):
             raise CompilationError('PIVOT BY is not supported with UNION')
-        if isinstance(inner, EvalSelect):
+        if isinstance(inner, EvalGroupingSets):
+            # Use inner.grouping_sets for compile-time check
+            pivots = self._compile_pivot_by(node.pivot_by, inner.c_targets, None, inner.grouping_sets)
+            if pivots:
+                return EvalPivot(eval_query, pivots)
+        elif isinstance(inner, EvalSelect):
+            # Use inner.grouping_indexes for compile-time check
             pivots = self._compile_pivot_by(node.pivot_by, inner.c_targets, inner.group_indexes)
             if pivots:
                 return EvalPivot(eval_query, pivots)
@@ -218,7 +227,13 @@ class Compiler:
         for select in node.queries:
             self.table = saved_table
             eq = self._compile(select)
-            if isinstance(eq, EvalSelect):
+
+            # _compile returns EvalQuery for parenthesised subqueries
+            # (which already carry their own ORDER BY / LIMIT), but a bare
+            # SELECT compiles to EvalSelect and a GROUPING SETS SELECT
+            # compiles to EvalGroupingSets (an EvalUnion subclass).  Wrap
+            # both non-EvalQuery cases so every operand has the same shape.
+            if not isinstance(eq, EvalQuery):
                 eq = EvalQuery(select=eq, order_spec=[], limit=None)
             compiled.append(eq)
 
@@ -250,6 +265,16 @@ class Compiler:
 
     @_compile.register
     def _select(self, node: ast.Select):
+        """Compile a SELECT clause into Eval nodes.
+
+        Queries without or with simple GROUP BY compile to EvalSelect nodes.
+        Complex grouping (GROUP BY GROUPING SETS(...)) compiles to
+        EvalGroupingSets, as this produces a UNION of multiple queries with
+        different grouping settings.
+
+        Returns:
+            EvalSelect for single GROUP BY or EvalGroupingSets for GROUP BY GROUPING SETS.
+        """
         self.stack.append(self.table)
 
         # Compile the FROM clause.
@@ -276,26 +301,111 @@ class Compiler:
         new_targets, grouping_sets, having_index = self._compile_group_by(node.group_by, c_targets)
         c_targets.extend(new_targets)
 
-        # Temprorary guard: desugaring multiple grouping sets into EvalUnion is
-        # not yet implemented.  A single set is unwrapped to the flat
-        # group_indexes expected by EvalSelect and query_execute.py.
-        if grouping_sets is not None and len(grouping_sets) > 1:
-            raise NotImplementedError('GROUPING SETS not yet implemented')
-        group_indexes = grouping_sets[0] if grouping_sets is not None else None
+        # Single-set / plain GROUP BY: flatten to a flat group_indexes and
+        # return a plain EvalSelect, identical to the pre-GROUPING-SETS path.
+        if grouping_sets is None or len(grouping_sets) == 1:
+            group_indexes = grouping_sets[0] if grouping_sets is not None else None
 
-        # ORDER BY and LIMIT are compiled by the enclosing _query handler,
-        # which also validates aggregate coverage after ORDER BY targets are added.
-        select = EvalSelect(
-            table=self.table,
-            c_targets=c_targets,
-            c_where=c_where,
-            group_indexes=group_indexes,
-            having_index=having_index,
-            distinct=node.distinct,
+            # ORDER BY and LIMIT are compiled by the enclosing _query handler,
+            # which also validates aggregate coverage after ORDER BY targets are added.
+            select = EvalSelect(
+                table=self.table,
+                c_targets=c_targets,
+                c_where=c_where,
+                group_indexes=group_indexes,
+                having_index=having_index,
+                distinct=node.distinct,
+            )
+
+            self.stack.pop()
+            return select
+
+        # Multiple grouping sets: desugar into EvalGroupingSets (EvalUnion subclass).
+        self.stack.pop()
+        return self._desugar_grouping_sets(
+            grouping_sets, c_targets, c_where, having_index, node.distinct
         )
 
-        self.stack.pop()
-        return select
+    def _desugar_grouping_sets(
+        self, grouping_sets, c_targets, c_where, having_index, distinct
+    ):
+        """Lower multiple grouping sets into an EvalGroupingSets node.
+
+        Each set produces one EvalSelect operand.  Non-grouped visible targets
+        are replaced with EvalConstant(None, dtype) so all operands share an
+        identical column structure.  The operands are joined by UNION ALL.
+
+        Args:
+          grouping_sets: List of index-lists, one per set (len >= 2).
+          c_targets: Compiled target list shared by all operands.
+          c_where: Compiled WHERE/FROM expression, or None.
+          having_index: Index of the invisible HAVING target, or None.
+          distinct: Whether DISTINCT was requested on the SELECT.
+
+        Returns:
+          An EvalGroupingSets carrying the raw per-operand grouping sets so that
+          PIVOT BY can validate its axis columns with per-set precision.
+        """
+        # Duplicate sets would produce identical rows via UNION ALL.
+        seen_sets = set()
+        for one_set in grouping_sets:
+            key = tuple(sorted(one_set))
+            if key in seen_sets:
+                raise CompilationError(
+                    f'duplicate grouping set {list(one_set)!r}: '
+                    'identical sets produce duplicate rows')
+            seen_sets.add(key)
+
+        # Every visible non-aggregate target must appear in at least one set.
+        visible_nonaggregate_indexes = {
+            i for i, t in enumerate(c_targets)
+            if t.name is not None and not t.is_aggregate
+        }
+        covered = {idx for one_set in grouping_sets for idx in one_set}
+        missing = visible_nonaggregate_indexes - covered
+        if missing:
+            missing_names = [f'"{c_targets[i].name}"' for i in sorted(missing)]
+            raise CompilationError(
+                'the following SELECT columns are not covered by any grouping set: '
+                + ', '.join(missing_names))
+
+        # Build one EvalSelect per grouping set.  Targets absent from the set
+        # are replaced with EvalConstant(None, dtype) so the column structure
+        # is identical across all operands.
+        operands = []
+        for one_set in grouping_sets:
+            set_indexes = set(one_set)
+            operand_targets = []
+            for i, t in enumerate(c_targets):
+                if not t.is_aggregate and i not in set_indexes:
+                    # Replace with NULL of the same dtype so column types match.
+                    null_expr = EvalConstant(None, t.c_expr.dtype)
+                    operand_targets.append(EvalTarget(null_expr, t.name, t.is_aggregate))
+                else:
+                    operand_targets.append(t)
+
+            # group_indexes for this operand: all non-aggregate indexes
+            # (both real and NULL-substituted ones keep the column grouped).
+            operand_group_indexes = [
+                i for i, t in enumerate(operand_targets)
+                if not t.is_aggregate
+            ]
+
+            operand_select = EvalSelect(
+                table=self.table,
+                c_targets=operand_targets,
+                c_where=c_where,
+                group_indexes=operand_group_indexes,
+                having_index=having_index,
+                distinct=distinct,
+            )
+            operands.append(EvalQuery(select=operand_select, order_spec=[], limit=None))
+
+        return EvalGroupingSets(
+            queries=operands,
+            set_operators=['union_all'] * (len(operands) - 1),
+            grouping_sets=grouping_sets,
+        )
 
     def _compile_from(self, node):
         if node is None:
@@ -450,13 +560,16 @@ class Compiler:
 
         return new_targets[len(c_targets):], order_spec
 
-    def _compile_pivot_by(self, pivot_by, targets, group_indexes):
+    def _compile_pivot_by(self, pivot_by, targets, group_indexes, grouping_sets=None):
         """Compiles a PIVOT BY clause.
 
         Resolve and validate columns references in the PIVOT BY clause.
-        The PIVOT BY clause accepts two name od index references to
-        columns in the SELECT targets list. The second columns should be a
-        GROUP BY column so that the values of the pivot column are unique.
+        The PIVOT BY clause accepts two name or index references to columns in
+        the SELECT targets list.  When grouping_sets is provided (GROUPING SETS)
+        , validates that the pivot column never appears in a
+        grouping set without the row column — which would let two rows share the
+        same pivot key without a unique row identity.  For plain GROUP BY, falls
+        back to checking membership in group_indexes.
 
         """
         if pivot_by is None:
@@ -489,7 +602,14 @@ class Compiler:
         # Sanity checks.
         if indexes[0] == indexes[1]:
             raise CompilationError('the two PIVOT BY columns cannot be the same column')
-        if indexes[1] not in group_indexes:
+        if grouping_sets is not None:
+            # The pivot column must appear in at least one grouping set so that
+            # it takes on real (non-NULL) values to pivot on.  Grand-total sets
+            # FIXME: This is not optimal as many cases that produce ambiguous
+            # pivoting key values are not caught by this check.
+            if not any(indexes[1] in one_set for one_set in grouping_sets):
+                raise CompilationError('the second PIVOT BY column must be a GROUP BY column')
+        elif indexes[1] not in group_indexes:
             raise CompilationError('the second PIVOT BY column must be a GROUP BY column')
 
         return indexes

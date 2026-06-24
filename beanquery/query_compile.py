@@ -27,6 +27,7 @@ from beanquery.parser import ast
 from beanquery import query_execute
 from beanquery import types
 from beanquery import tables
+from beanquery.errors import DataError
 
 
 MARKER = object()
@@ -688,6 +689,19 @@ class EvalUnion:
         return result_types, rows, visible_mask
 
 
+@dataclasses.dataclass
+class EvalGroupingSets(EvalUnion):
+    """An EvalUnion produced by desugaring GROUP BY GROUPING SETS.
+
+    Carries the raw per-operand grouping sets so that PIVOT BY can validate
+    its axis columns against the exact set membership of each operand.
+
+    Execution logic is inherited from EvalUnion.
+    """
+
+    grouping_sets: list[list[int]]
+
+
 # A compiled query wrapping a SELECT or a UNION of multiple SELECTs.
 #
 # This mirrors ast.Query which wraps ast.Select and owns ORDER BY, LIMIT.
@@ -773,14 +787,18 @@ class EvalPivot:
         othercols = [i for i in range(len(columns)) if i not in self.pivots]
         nother = len(othercols)
         other = lambda x: tuple(x[i] for i in othercols)
-        keys = sorted({row[col2] for row in rows})
+        # ROLLUP/CUBE grand-total rows produce NULL for the pivot column; sort them last.
+        keys = sorted({row[col2] for row in rows}, key=lambda k: (k is None, k))
 
         # Compute the new column names and dtypes.
         if nother > 1:
             it = itertools.product(keys, other(columns))
-            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}/{col.name}' for key, col in it]
+            names = (
+                [f'{columns[col1].name}/{columns[col2].name}'] 
+                + [f"{('NULL' if key is None else key)}/{col.name}" for key, col in it]
+            )
         else:
-            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}' for key in keys]
+            names = [f'{columns[col1].name}/{columns[col2].name}'] + ['NULL' if key is None else f'{key}' for key in keys]
         datatypes = [columns[col1].datatype] + [col.datatype for col in other(columns)] * len(keys)
         columns = tuple(cursor.Column(name, datatype) for name, datatype in zip(names, datatypes))
 
@@ -789,8 +807,15 @@ class EvalPivot:
         rows.sort(key=operator.itemgetter(col1))
         for field1, group in itertools.groupby(rows, key=operator.itemgetter(col1)):
             outrow = [field1] + [None] * (len(columns) - 1)
+            written_indices = set()
             for row in group:
                 index = keys.index(row[col2]) * nother + 1
+                if index in written_indices:
+                    raise DataError(
+                        f'PIVOT BY duplicate key: column {columns[col2].name} '
+                        f'has duplicate value {row[col2]!r} for {columns[col1].name}={field1!r}'
+                    )
+                written_indices.add(index)
                 outrow[index:index+nother] = other(row)
             pivoted.append(tuple(outrow))
 

@@ -572,21 +572,37 @@ class TestCompileSelectGroupingSets(CompileSelectBase):
         """)
         self.assertEqual([], query.select.group_indexes)
 
-    def test_multi_set_raises_not_implemented(self):
-        # Multiple grouping sets hit the Phase 2 guard.
-        with self.assertRaises(NotImplementedError):
-            self.compile("""
-              SELECT account, sum(number)
-              GROUP BY GROUPING SETS ((account), ());
-            """)
+    def test_multi_set_desugars_to_eval_grouping_sets(self):
+        # Multiple grouping sets desugar into EvalGroupingSets wrapping
+        # one EvalQuery(EvalSelect) per set, all joined by 'union_all'.
+        query = self.compile("""
+          SELECT account, sum(number)
+          GROUP BY GROUPING SETS ((account), ());
+        """)
+        inner = query.select
+        self.assertIsInstance(inner, qc.EvalGroupingSets)
+        self.assertEqual(len(inner.queries), 2)
+        self.assertEqual(inner.set_operators, ['union_all'])
 
-    def test_mixed_plain_plus_grouping_sets_multi_raises(self):
-        # A plain column combined with GROUPING SETS with >1 set also raises.
-        with self.assertRaises(NotImplementedError):
-            self.compile("""
-              SELECT account, date, sum(number)
-              GROUP BY account, GROUPING SETS ((date), ());
-            """)
+    def test_mixed_plain_plus_grouping_sets_desugars(self):
+        # A plain column prefix combined with GROUPING SETS desugars into
+        # EvalGroupingSets.  The plain prefix appears in every grouping set.
+        query = self.compile("""
+          SELECT account, date, sum(number)
+          GROUP BY account, GROUPING SETS ((date), ());
+        """)
+        inner = query.select
+        self.assertIsInstance(inner, qc.EvalGroupingSets)
+        self.assertEqual(len(inner.queries), 2)
+        # 'account' is in every set (cartesian prefix); 'date' is only in one set.
+        account_idx = next(
+            i for i, t in enumerate(inner.c_targets) if t.name == 'account'
+        )
+        date_idx = next(
+            i for i, t in enumerate(inner.c_targets) if t.name == 'date'
+        )
+        self.assertTrue(all(account_idx in s for s in inner.grouping_sets))
+        self.assertFalse(all(date_idx in s for s in inner.grouping_sets))
 
     def test_having_with_single_grouping_set(self):
         # HAVING compiles normally alongside a single GROUPING SETS.
