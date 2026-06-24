@@ -1310,6 +1310,162 @@ class TestExecuteGroupingSets(QueryBase):
                 ('Expenses:Transport', D('20.00'), D('40.00')),
             ])
 
+    def test_rollup_single_column(self):
+        # ROLLUP on a single column is equivalent to GROUPING SETS ((a), ())
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account)
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                ('Expenses:Food',      D('40.00')),
+                ('Expenses:Transport', D('60.00')),
+                (None,                 D('100.00')),
+            ])
+
+    def test_rollup_two_columns(self):
+        # ROLLUP(a, b) desugars to GROUPING SETS ((a, b), (a), ())
+        # Creates hierarchical subtotals from right to left.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account, yr)
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+                (None,                 None, D('100.00')),
+            ])
+
+    def test_rollup_three_columns(self):
+        # ROLLUP(a, b, c) desugars to GROUPING SETS ((a, b, c), (a, b), (a), ())
+        # Creates hierarchical subtotals from right to left.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, month(date) AS mo, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account, yr, mo)
+            """,
+            [('account', str), ('yr', int), ('mo', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, 3,  D('10.00')),
+                ('Expenses:Transport', 2020, 6,  D('20.00')),
+                ('Expenses:Food',      2021, 3,  D('30.00')),
+                ('Expenses:Transport', 2021, 6,  D('40.00')),
+                ('Expenses:Food',      2020, None, D('10.00')),
+                ('Expenses:Transport', 2020, None, D('20.00')),
+                ('Expenses:Food',      2021, None, D('30.00')),
+                ('Expenses:Transport', 2021, None, D('40.00')),
+                ('Expenses:Food',      None, None, D('40.00')),
+                ('Expenses:Transport', None, None, D('60.00')),
+                (None,                 None, None, D('100.00')),
+            ])
+
+    def test_mixed_plain_and_rollup(self):
+        # GROUP BY a, ROLLUP(b) computes cross-product:
+        # a -> [[a]]
+        # ROLLUP(b) -> [[a, b], [a]]
+        # Cross-product: [[a, b], [a]]
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY account, ROLLUP (yr)
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+            ])
+
+    def test_mixed_grouping_sets_and_rollup(self):
+        # GROUP BY GROUPING SETS((a, b)), ROLLUP(c) computes cross-product of elements:
+        # GROUPING SETS((a, b)) -> [[a, b]]
+        # ROLLUP(c) -> [[c], []]
+        # Cross-product: [[a, b, c], [a, b]]
+        # NOT: [[a, b, c], [a, b], [a, b]] (would have duplicate [a, b])
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, month(date) AS mo, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account, yr)), ROLLUP (mo)
+            """,
+            [('account', str), ('yr', int), ('mo', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, 3,  D('10.00')),
+                ('Expenses:Transport', 2020, 6,  D('20.00')),
+                ('Expenses:Food',      2021, 3,  D('30.00')),
+                ('Expenses:Transport', 2021, 6,  D('40.00')),
+                ('Expenses:Food',      2020, None, D('10.00')),
+                ('Expenses:Transport', 2020, None, D('20.00')),
+                ('Expenses:Food',      2021, None, D('30.00')),
+                ('Expenses:Transport', 2021, None, D('40.00')),
+            ])
+
+    def test_rollup_with_pivot_by(self):
+
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account, yr)
+            PIVOT BY account, yr
+            """,
+            [
+                ('account/yr', str),
+                ('2020', Decimal),
+                ('2021', Decimal),
+                ('NULL', Decimal),
+            ],
+            [
+                (None,                 None,       None,       D('100.00')),
+                ('Expenses:Food',      D('10.00'), D('30.00'), D('40.00')),
+                ('Expenses:Transport', D('20.00'), D('40.00'), D('60.00')),
+            ])
+
+    def test_rollup_with_pivot_by_inverted(self):
+        # Same ROLLUP as above but PIVOT BY yr, account (row=yr, pivot=account).
+        # ROLLUP(account, yr) sets: (account,yr), (account), ().
+        # yr=2020: Food=10, Transport=20; yr=2021: Food=30, Transport=40.
+        # yr=None: Food=40 (from (account) set), Transport=60, NULL=100 (from () set).
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account, yr)
+            PIVOT BY yr, account
+            """,
+            [
+                ('yr/account', int),
+                ('Expenses:Food', Decimal),
+                ('Expenses:Transport', Decimal),
+                ('NULL', Decimal),
+            ],
+            [
+                (None, D('40.00'), D('60.00'), D('100.00')),
+                (2020, D('10.00'), D('20.00'), None),
+                (2021, D('30.00'), D('40.00'), None),
+            ])
+
 
 class TestExecuteOptions(QueryBase):
 

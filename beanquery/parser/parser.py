@@ -25,36 +25,37 @@ from tatsu.util import re, generic_main
 
 
 KEYWORDS: set[str] = {
-    'GROUPING',
-    'IN',
-    'CREATE',
-    'INTO',
-    'JOURNAL',
-    'DESC',
     'LIMIT',
-    'AND',
-    'PIVOT',
-    'AS',
-    'FROM',
-    'IS',
-    'USING',
-    'FALSE',
-    'ASC',
-    'HAVING',
-    'PRINT',
-    'BY',
-    'SETS',
-    'WHERE',
-    'INSERT',
-    'BALANCES',
-    'OR',
-    'TABLE',
-    'ORDER',
-    'TRUE',
     'DISTINCT',
-    'NOT',
+    'INTO',
+    'USING',
+    'PRINT',
+    'JOURNAL',
+    'ASC',
+    'TRUE',
     'SELECT',
+    'DESC',
+    'HAVING',
+    'OR',
+    'FALSE',
+    'AS',
+    'GROUPING',
+    'NOT',
+    'IN',
+    'AND',
+    'IS',
+    'ORDER',
+    'INSERT',
+    'CREATE',
+    'PIVOT',
+    'WHERE',
+    'TABLE',
+    'BY',
+    'FROM',
+    'SETS',
     'GROUP',
+    'ROLLUP',
+    'BALANCES',
 }
 
 
@@ -419,11 +420,14 @@ class BQLParser(Parser):
             with self._option():
                 self._grouping_sets_()
             with self._option():
+                self._rollup_()
+            with self._option():
                 self._group_column_()
             self._error(
                 'expecting one of: '
-                "'GROUPING' <expression> <group_column>"
-                '<grouping_sets> <integer>'
+                "'GROUPING' 'ROLLUP' <expression>"
+                '<group_column> <grouping_sets> <integer>'
+                '<rollup>'
             )
 
     @tatsumasu('GroupColumn')
@@ -456,6 +460,30 @@ class BQLParser(Parser):
         self.name_last_node('sets')
         self._token(')')
         self._define(['sets'], [])
+
+    @tatsumasu('Rollup')
+    def _rollup_(self):
+        self._token('ROLLUP')
+        self._token('(')
+
+        def sep0():
+            self._token(',')
+
+        def block1():
+            with self._group():
+                with self._choice():
+                    with self._option():
+                        self._integer_()
+                    with self._option():
+                        self._expression_()
+                    self._error(
+                        'expecting one of: '
+                        '<expression> <integer>'
+                    )
+        self._gather(block1, sep0)
+        self.name_last_node('columns')
+        self._token(')')
+        self._define(['columns'], [])
 
     @tatsumasu()
     def _grouping_set_(self):

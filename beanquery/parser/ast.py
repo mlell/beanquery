@@ -179,6 +179,15 @@ GroupColumn = node('GroupColumn', 'column')
 #   sets: A list of lists; each inner list is one grouping set.
 GroupingSets = node('GroupingSets', 'sets')
 
+# A ROLLUP (...) element in a GROUP BY clause.
+#
+# ROLLUP(a, b, c) is equivalent to GROUPING SETS((a, b, c), (a, b), (a), ()).
+# It creates hierarchical subtotals from right to left.
+#
+# Attributes:
+#   columns: A list of column/expression/integer items.
+Rollup = node('Rollup', 'columns')
+
 # An ORDER BY clause.
 #
 # Attributes:

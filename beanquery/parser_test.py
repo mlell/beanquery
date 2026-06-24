@@ -11,6 +11,7 @@ from beanquery.parser import ast
 
 GC = ast.GroupColumn
 GS = ast.GroupingSets
+RU = ast.Rollup
 
 
 def Select(targets, from_clause=None, where_clause=None, **kwargs):
@@ -419,6 +420,38 @@ class TestSelectGroupBy(QueryParserTestBase):
                    group_by=ast.GroupBy(
                        [GS([[ast.Column('a')]]),
                         GS([[ast.Column('b')], []])], None)))
+
+    def test_groupby_rollup_single(self):
+        self.assertParse(
+            "SELECT * GROUP BY ROLLUP (a);",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [RU([ast.Column('a')])], None)))
+
+    def test_groupby_rollup_multiple(self):
+        self.assertParse(
+            "SELECT * GROUP BY ROLLUP (a, b, c);",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [RU([ast.Column('a'), ast.Column('b'), ast.Column('c')])], None)))
+
+    def test_groupby_rollup_having(self):
+        self.assertParse(
+            "SELECT * GROUP BY ROLLUP (a) HAVING sum(x) > 0;",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [RU([ast.Column('a')])],
+                       ast.Greater(
+                           ast.Function('sum', [ast.Column('x')]),
+                           ast.Constant(0)))))
+
+    def test_groupby_mixed_plain_and_rollup(self):
+        self.assertParse(
+            "SELECT * GROUP BY a, ROLLUP (b, c);",
+            Select(ast.Asterisk(),
+                   group_by=ast.GroupBy(
+                       [GC(ast.Column('a')),
+                        RU([ast.Column('b'), ast.Column('c')])], None)))
 
 
 class TestSelectOrderBy(QueryParserTestBase):

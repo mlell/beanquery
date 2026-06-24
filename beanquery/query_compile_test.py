@@ -614,6 +614,37 @@ class TestCompileSelectGroupingSets(CompileSelectBase):
         self.assertEqual([0], query.select.group_indexes)
         self.assertIsNotNone(query.select.having_index)
 
+    def test_cross_product_of_grouping_elements(self):
+        # Verify cross-product of GROUP BY elements (SQL standard), not full cartesian
+        # GROUP BY GROUPING SETS((a)), ROLLUP(b)
+        # Element 1: GROUPING SETS((a)) -> [[a]]
+        # Element 2: ROLLUP(b) -> [[b], []]
+        # 
+        # SQL standard (cross-product of elements):
+        #   [[a]] × [[b], []] = [[a, b], [a]]
+        #   Produces 2 union operands
+        #
+        # Full cartesian of all sets (NOT SQL standard):
+        #   [[a]] × [[b], []] = [[a, b], [a], [a]] (duplicate [a] from empty set)
+        #   Would produce 3 union operands
+        query = self.compile("""
+          SELECT account, year(date) AS yr, sum(number)
+          GROUP BY GROUPING SETS ((account)), ROLLUP (yr)
+        """)
+        inner = query.select
+        self.assertIsInstance(inner, qc.EvalGroupingSets)
+        # Should have 2 operands: (account, yr) and (account)
+        self.assertEqual(len(inner.queries), 2)
+        # 'account' is in every set; 'yr' is only in one set.
+        account_idx = next(
+            i for i, t in enumerate(inner.c_targets) if t.name == 'account'
+        )
+        yr_idx = next(
+            i for i, t in enumerate(inner.c_targets) if t.name == 'yr'
+        )
+        self.assertTrue(all(account_idx in s for s in inner.grouping_sets))
+        self.assertFalse(all(yr_idx in s for s in inner.grouping_sets))
+
 
 class TestCompileSelectOrderBy(CompileSelectBase):
 

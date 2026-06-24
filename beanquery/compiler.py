@@ -642,16 +642,18 @@ class Compiler:
             assert group_by.elements, "Internal error with GROUP-BY parsing"
 
             # Determine whether any element is a complex grouping construct
-            # (GROUPING SETS).  Plain GROUP BY keeps the hidden-target fallback;
+            # (GROUPING SETS or ROLLUP).  Plain GROUP BY keeps the hidden-target fallback;
             # complex GROUP BY forbids it so every union operand shares an
             # identical column structure.
-            is_complex = any(isinstance(e, ast.GroupingSets) for e in group_by.elements)
+            complex_elements = (ast.GroupingSets, ast.Rollup)
+            is_complex = any(isinstance(e, complex_elements) for e in group_by.elements)
 
             targets_name_map = {target.name: index for index, target in enumerate(c_targets)}
 
             # Each element expands to a list of index-sets:
             #   plain GroupColumn  -> [[idx]]
             #   GroupingSets       -> [[...], [...], ...] (one per set)
+            #   Rollup             -> [[i1, i2], [i1], []] (hierarchical)
             element_set_lists = []
             for element in group_by.elements:
                 if isinstance(element, ast.GroupColumn):
@@ -674,6 +676,23 @@ class Compiler:
                             for col in one_set
                         ]
                         sets_for_element.append(resolved_set)
+                    element_set_lists.append(sets_for_element)
+
+                elif isinstance(element, ast.Rollup):
+                    # ROLLUP(a, b, c) desugars to GROUPING SETS((a, b, c), (a, b), (a), ())
+                    # Resolve all columns to indices first
+                    resolved_columns = [
+                        self._compile_group_by_simple_element(
+                            col, c_targets, new_targets,
+                            c_target_expressions, targets_name_map,
+                            strict=True,
+                        )
+                        for col in element.columns
+                    ]
+                    # Generate hierarchical sets from most specific to least specific
+                    sets_for_element = []
+                    for i in range(len(resolved_columns), -1, -1):
+                        sets_for_element.append(resolved_columns[:i] if i > 0 else [])
                     element_set_lists.append(sets_for_element)
 
                 else:
