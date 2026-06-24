@@ -804,7 +804,7 @@ class EvalPivot:
 
         # Populate the pivoted table.
         pivoted = []
-        rows.sort(key=operator.itemgetter(col1))
+        rows.sort(key=lambda row: (row[col1] is not None, row[col1]))
         for field1, group in itertools.groupby(rows, key=operator.itemgetter(col1)):
             outrow = [field1] + [None] * (len(columns) - 1)
             written_indices = set()
