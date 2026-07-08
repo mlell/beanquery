@@ -1,0 +1,31 @@
+branches:
+- name: dev-function-help
+  base-commit: 62b6abba7
+  base-date: 2026-06-11 22:28:39 +0200
+  merged: true
+  description: Group function help by type
+- name: dev-all-lhs
+  base-commit: 62b6abba7
+  base-date: 2026-06-11 22:28:39 +0200
+  merged: true
+  description: ALL/ANY syntax with inverted operand order
+- name: dev-case-when
+  description: Provide SQL equivalent of if/else
+  base-commit: 62b6abba7
+  base-date: 2026-06-11 22:28:39 +0200
+  merged: true
+- name: dev-date-cap
+  base-commit: 62b6abba7
+  base-date: 2026-06-11 22:28:39 +0200
+  merged: true
+  description: Lump dates before/after some point in time
+- name: dev-union
+  description: SQL UNION support
+  base-commit: 62b6abba7
+  base-date: 2026-06-11 22:28:39 +0200
+  merged: true
+- name: dev-grouping-sets
+  description: SQL GROUPING SETS/ROLLUP/CUBE support
+  merged: true
+  base-commit: 62b6abba7
+  base-date: 2026-06-11 22:28:39 +0200
