@@ -18,6 +18,7 @@ from .query_compile import (
     EvalAnd,
     EvalAll,
     EvalAny,
+    EvalCase,
     EvalCoalesce,
     EvalColumn,
     EvalConstant,
@@ -682,6 +683,68 @@ class Compiler:
         op = OPERATORS[type(node)][0]
         return op(left, right)
 
+    def _try_coerce_operand(self, operand, target_type):
+        """Attempt to coerce an operand to a target type.
+
+        This performs value-transforming casts only (via a registered BQL
+        cast function). It does not handle 'set'/'typing.Set[T]' widening,
+        since no value transformation is needed there; use
+        'types.common_set_type' for that case instead.
+
+        Args:
+          operand: An EvalNode to coerce.
+          target_type: The desired type to coerce to.
+
+        Returns:
+          Coerced EvalNode if coercion is possible, None otherwise.
+        """
+        if operand.dtype == target_type:
+            return operand
+
+        resolved_type = types.coercion_target_type(FUNCTIONS, operand.dtype, target_type)
+        if resolved_type is None:
+            return None
+
+        name = types.MAP[resolved_type]
+        func = types.function_lookup(FUNCTIONS, name, [operand])
+        return func(self.context, [operand])
+
+    def _try_coerce_to_common_type(self, operands):
+        """Find a common type across N operands and coerce all of them to it.
+
+        Generalizes ``_try_coerce_operand``/``types.common_coercion_type`` to
+        more than two operands by folding pairwise over the whole list. This
+        includes 'set'/'typing.Set[T]' widening (see 'types.common_set_type'):
+        when the resolved common type is a set widening rather than a value
+        cast, the original operand is kept unchanged since no value
+        transformation is needed.
+
+        Args:
+          operands: A non-empty list of EvalNode instances.
+
+        Returns:
+          (common_dtype, coerced_operands, None) on success, or
+          (None, None, (source_dtype, target_dtype, index)) describing the
+          first incompatible operand encountered, where 'index' is its
+          position in 'operands'.
+        """
+        dtype = operands[0].dtype
+        for i, operand in enumerate(operands[1:], 1):
+            common = types.common_coercion_type(FUNCTIONS, dtype, operand.dtype)
+            if common is None:
+                return None, None, (dtype, operand.dtype, i)
+            dtype = common
+
+        # Coerce every operand to the resolved common type. Set widening
+        # (set / typing.Set[T]) needs no value coercion, so keep the original
+        # node when no cast function is found.
+        coerced = []
+        for operand in operands:
+            c = self._try_coerce_operand(operand, dtype)
+            coerced.append(operand if c is None else c)
+
+        return dtype, coerced, None
+
     @_compile.register
     def _binaryop(self, node: ast.BinaryOp):
         left = self._compile(node.left)
@@ -699,33 +762,17 @@ class Compiler:
                     return function
 
             # Implement type inference when one of the operands is not strongly typed.
-            if left.dtype is object and right.dtype is not object:
-                target = right.dtype
-                if target is int:
-                    # The Beancount parser does not emit int typed
-                    # values, thus casting to int is only going to
-                    # loose information. Promote to decimal.
-                    target = Decimal
-                name = types.MAP.get(target)
-                if name is None:
-                    break
-                left = types.function_lookup(FUNCTIONS, name, [left])(self.context, [left])
-                continue
-            if right.dtype is object and left.dtype is not object:
-                target = left.dtype
-                if target is int:
-                    # The Beancount parser does not emit int typed
-                    # values, thus casting to int is only going to
-                    # loose information. Promote to decimal.
-                    target = Decimal
-                name = types.MAP.get(target)
-                if name is None:
-                    break
-                right = types.function_lookup(FUNCTIONS, name, [right])(self.context, [right])
-                continue
-
-            # Failure.
-            break
+            common_dtype, coerced, error = self._try_coerce_to_common_type([left, right])
+            if error is not None:
+                break
+            new_left, new_right = coerced
+            if new_left is left and new_right is right:
+                # No progress possible (e.g. both operands already share a
+                # type, but no matching operator exists for it). Avoid
+                # looping forever.
+                break
+            left, right = new_left, new_right
+            continue
 
         raise CompilationError(
             f'operator "{type(node).__name__.lower()}('
@@ -742,6 +789,44 @@ class Compiler:
             if node.value in self.table.columns:
                 return self._column(ast.Column(node.value))
         return EvalConstant(node.value)
+
+    @_compile.register
+    def _case(self, node: ast.Case):
+        # Compile all WHEN clauses
+        when_clauses = [
+            (self._compile(when_clause.condition), self._compile(when_clause.result))
+            for when_clause in node.when_clauses
+        ]
+
+        # Compile ELSE clause if present
+        else_expr = self._compile(node.else_expr) if node.else_expr is not None else None
+
+        results = [result for _, result in when_clauses]
+        if else_expr is not None:
+            results.append(else_expr)
+
+        if not results:
+            raise CompilationError('CASE expression must have at least one WHEN clause', node)
+
+        # Resolve a common result type across all branches, coercing each
+        # branch result so that the declared dtype matches what is actually
+        # returned at runtime.
+        result_dtype, coerced_results, error = self._try_coerce_to_common_type(results)
+        if error is not None:
+            source_dtype, target_dtype, i = error
+            raise CompilationError(
+                f'CASE expression has incompatible types: '
+                f'{types.name(source_dtype)} and {types.name(target_dtype)} at position {i}',
+                node)
+
+        when_clauses = [
+            (condition, coerced_result)
+            for (condition, _), coerced_result in zip(when_clauses, coerced_results)
+        ]
+        if else_expr is not None:
+            else_expr = coerced_results[-1]
+
+        return EvalCase(when_clauses, else_expr, result_dtype)
 
     @_compile.register
     def _placeholder(self, node: ast.Placeholder):

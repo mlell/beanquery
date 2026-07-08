@@ -529,6 +529,54 @@ class EvalRow(EvalNode):
         return context
 
 
+class EvalCase(EvalNode):
+    """Evaluate a CASE WHEN expression.
+
+    Evaluates WHEN conditions in order and returns the result of the first
+    matching condition. If no conditions match, returns the ELSE expression
+    result (or None if no ELSE clause).
+    """
+    __slots__ = ('when_clauses', 'else_expr', 'dtype')
+
+    def __init__(self, when_clauses, else_expr, dtype):
+        super().__init__(dtype)
+        self.when_clauses = when_clauses  # List of (condition, result) tuples
+        self.else_expr = else_expr
+
+    def childnodes(self):
+        """Returns the child nodes of this node.
+
+        Overrides the default implementation to properly handle when_clauses
+        which is a list of (condition, result) tuples.
+
+        Yields:
+          EvalNode instances from conditions, results, and else_expr.
+        """
+        # Yield nodes from when_clauses (list of tuples)
+        for condition, result in self.when_clauses:
+            if isinstance(condition, EvalNode):
+                yield condition
+            if isinstance(result, EvalNode):
+                yield result
+
+        # Yield else_expr if present
+        if self.else_expr is not None and isinstance(self.else_expr, EvalNode):
+            yield self.else_expr
+
+    def __call__(self, context):
+        # Evaluate WHEN clauses in order
+        for condition, result in self.when_clauses:
+            condition_value = condition(context)
+            # Check if condition is true (handle NULL as false)
+            if condition_value is True:
+                return result(context)
+
+        # No conditions matched, return ELSE result or None
+        if self.else_expr is not None:
+            return self.else_expr(context)
+        return None
+
+
 class EvalColumn(EvalNode):
     pass
 

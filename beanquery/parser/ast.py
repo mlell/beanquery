@@ -318,6 +318,11 @@ Any = node('Any', 'left op right side')
 All = node('All', 'left op right side')
 
 
+# CASE WHEN expression nodes
+Case = node('Case', 'when_clauses else_expr')
+WhenClause = node('WhenClause', 'condition result')
+
+
 CreateTable = node('CreateTable', 'name columns using query')
 
 Insert = node('Insert', 'table columns values')

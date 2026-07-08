@@ -850,3 +850,312 @@ class TestQuotedIdentifiers(unittest.TestCase):
         # if the double quoted string is not a table name, it is a string literal ideed
         query = self.compile('''SELECT "a" + "b" FROM postings''')
         self.assertEqual(query.c_targets[0].c_expr.value, 'ab')
+
+
+class TestTryCoerceOperand(unittest.TestCase):
+    """Tests for Compiler._try_coerce_operand helper method.
+
+    Note: The following behaviors are tested via integration tests in
+    query_execute_test.py and do not have dedicated unit tests here:
+    - int to Decimal coercion (tested in test_operators: SELECT 2.0 * 2)
+    - Decimal to int coercion (tested in test_operators: SELECT 2 * 2.0)
+    - object to Decimal coercion (tested in test_operators_type_inference)
+    - Value preservation through coercion (tested in test_operators)
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.context = Connection()
+        cls.context.tables['test'] = test.Table(0)
+        cls.compiler = compiler.Compiler(cls.context)
+        cls.compiler.table = cls.context.tables['test']
+
+    def test_same_type_returns_operand(self):
+        """When operand type matches target type, return operand unchanged (fast path)."""
+        operand = qc.EvalConstant(D('42'), D)
+        result = self.compiler._try_coerce_operand(operand, D)
+        self.assertIs(result, operand)
+
+    def test_int_target_promotes_to_decimal(self):
+        """When target is int, promote to Decimal to avoid information loss."""
+        operand = qc.EvalConstant(D('42'), D)
+        result = self.compiler._try_coerce_operand(operand, int)
+        self.assertIsNotNone(result)
+        # Should be coerced to Decimal, not int
+        self.assertEqual(result.dtype, D)
+        self.assertEqual(result(None), D('42'))
+
+    def test_unsupported_coercion_returns_none(self):
+        """When coercion is not possible, return None."""
+        # Try to coerce to a type that's not in types.MAP
+        operand = qc.EvalConstant(42, int)
+        result = self.compiler._try_coerce_operand(operand, object)
+        self.assertIsNone(result)
+
+
+class TestCaseWhen(CompileSelectBase):
+    """Test CASE WHEN expression parsing, compilation, and execution.
+
+    Note: This test class uses a custom Beancount dataset instead of the default
+    Connection() fixture because CASE WHEN type compatibility testing requires:
+
+    1. Predictable numeric values at specific boundaries (50, 75, 100, 200) to test
+       conditions like "WHEN number > 100" with known outcomes
+    2. Controlled Decimal values to test int + Decimal type coercion (e.g.,
+       "WHEN number > 100 THEN 1 ELSE number" must coerce int to Decimal)
+    3. Minimal dataset to make test assertions clear and maintainable
+
+    The default fixture has more complex/realistic data that would make these
+    boundary tests harder to write and reason about.
+    """
+
+    def setUp(self):
+        INPUT = """
+            2010-01-01 open Assets:Cash
+            2010-01-01 open Expenses:Food
+
+            2010-01-01 * "Transaction 1"
+                Assets:Cash           100.00 USD
+                Expenses:Food        -100.00 USD
+
+            2010-01-02 * "Transaction 2"
+                Assets:Cash           200.00 USD
+                Expenses:Food        -200.00 USD
+
+            2010-01-03 * "Transaction 3"
+                Assets:Cash            50.00 USD
+                Expenses:Food         -50.00 USD
+
+            2010-01-04 * "Transaction 4"
+                Assets:Cash            75.00 USD
+                Expenses:Food         -75.00 USD
+        """
+        entries, errors, options = loader.load_string(INPUT)
+        self.ctx = Connection('beancount:', entries=entries, errors=errors, options=options)
+
+    def execute(self, query):
+        return list(self.ctx.execute(query))
+
+    def test_case_when_simple(self):
+        """Test simple CASE WHEN with conditions."""
+        results = self.execute('''
+            SELECT
+              number,
+              CASE
+                WHEN number > 100 THEN 'Large'
+                WHEN number > 50 THEN 'Medium'
+                ELSE 'Small'
+              END as size
+            FROM postings
+            WHERE account = 'Assets:Cash'
+            ORDER BY number
+        ''')
+        self.assertEqual(len(results), 4)
+        self.assertEqual(results[0][1], 'Small')   # 50
+        self.assertEqual(results[1][1], 'Medium')  # 75
+        self.assertEqual(results[2][1], 'Medium')  # 100
+        self.assertEqual(results[3][1], 'Large')   # 200
+
+    def test_case_when_no_else(self):
+        """Test CASE WHEN without ELSE clause (should return NULL)."""
+        results = self.execute('''
+            SELECT
+              number,
+              CASE
+                WHEN number > 150 THEN 'Large'
+              END as size
+            FROM postings
+            WHERE account = 'Assets:Cash' AND number = 100
+        ''')
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(results[0][1])  # No condition matched, no ELSE
+
+    def test_case_when_with_aggregation(self):
+        """Test CASE WHEN with aggregate functions."""
+        results = self.execute('''
+            SELECT
+              account,
+              SUM(number) as total,
+              CASE
+                WHEN SUM(number) > 200 THEN 'High'
+                WHEN SUM(number) > 100 THEN 'Medium'
+                ELSE 'Low'
+              END as category
+            FROM postings
+            WHERE account ~ 'Assets|Expenses'
+            GROUP BY account
+            ORDER BY account
+        ''')
+        self.assertEqual(len(results), 2)
+        # Assets:Cash: 100 + 200 + 50 + 75 = 425 -> High
+        self.assertEqual(results[0][0], 'Assets:Cash')
+        self.assertEqual(results[0][2], 'High')
+        # Expenses:Food: -100 + -200 + -50 + -75 = -425 -> Low (negative)
+        self.assertEqual(results[1][0], 'Expenses:Food')
+        self.assertEqual(results[1][2], 'Low')
+
+    def test_case_when_string_comparison(self):
+        """Test CASE WHEN with string conditions."""
+        results = self.execute('''
+            SELECT
+              account,
+              CASE
+                WHEN account = 'Assets:Cash' THEN 'Asset'
+                WHEN account = 'Expenses:Food' THEN 'Expense'
+                ELSE 'Other'
+              END as type
+            FROM postings
+            WHERE account ~ 'Assets|Expenses'
+            ORDER BY account
+        ''')
+        self.assertEqual(len(results), 8)  # 4 transactions x 2 postings each
+        self.assertEqual(results[0][1], 'Asset')   # Assets:Cash
+        self.assertEqual(results[1][1], 'Asset')   # Assets:Cash
+        self.assertEqual(results[2][1], 'Asset')   # Assets:Cash
+        self.assertEqual(results[3][1], 'Asset')   # Assets:Cash
+        self.assertEqual(results[4][1], 'Expense') # Expenses:Food
+        self.assertEqual(results[5][1], 'Expense') # Expenses:Food
+        self.assertEqual(results[6][1], 'Expense') # Expenses:Food
+        self.assertEqual(results[7][1], 'Expense') # Expenses:Food
+
+    def test_case_when_numeric_result(self):
+        """Test CASE WHEN returning numeric values."""
+        results = self.execute('''
+            SELECT
+              account,
+              number,
+              CASE
+                WHEN account = 'Assets:Cash' THEN number * 2
+                ELSE number
+              END as adjusted
+            FROM postings
+            WHERE account = 'Assets:Cash' AND number = 100
+        ''')
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][2], D('200'))
+
+    def test_case_when_nested(self):
+        """Test nested CASE WHEN expressions."""
+        results = self.execute('''
+            SELECT
+              account,
+              number,
+              CASE
+                WHEN account = 'Assets:Cash' THEN
+                  CASE
+                    WHEN number > 150 THEN 'Large Asset'
+                    ELSE 'Small Asset'
+                  END
+                ELSE 'Not Asset'
+              END as classification
+            FROM postings
+            WHERE account ~ 'Assets|Expenses'
+            ORDER BY account, number
+        ''')
+        # We have 8 postings in total (4 transactions, 2 postings each)
+        self.assertEqual(len(results), 8)
+        # First 4 are Assets (ordered by amount: 50, 75, 100, 200)
+        self.assertEqual(results[0][2], 'Small Asset')  # Cash, 50
+        self.assertEqual(results[1][2], 'Small Asset')  # Cash, 75
+        self.assertEqual(results[2][2], 'Small Asset')  # Cash, 100
+        self.assertEqual(results[3][2], 'Large Asset')  # Cash, 200
+        # Last 4 are Expenses (negative amounts: -200, -100, -75, -50)
+        self.assertEqual(results[4][2], 'Not Asset')    # Food, -200
+        self.assertEqual(results[5][2], 'Not Asset')    # Food, -100
+        self.assertEqual(results[6][2], 'Not Asset')    # Food, -75
+        self.assertEqual(results[7][2], 'Not Asset')    # Food, -50
+
+    def test_case_when_mixed_int_decimal(self):
+        """Test CASE WHEN with mixed int and Decimal types -> should coerce to Decimal."""
+        results = self.execute('''
+            SELECT
+              account,
+              CASE
+                WHEN number > 100 THEN 1
+                ELSE number
+              END as result
+            FROM postings
+            WHERE account = 'Assets:Cash'
+            ORDER BY number
+        ''')
+        self.assertEqual(len(results), 4)
+        # First three should return the Decimal number value
+        self.assertEqual(results[0][1], D('50'))
+        self.assertEqual(results[1][1], D('75'))
+        self.assertEqual(results[2][1], D('100'))
+        # Last one should return 1 (coerced to Decimal)
+        self.assertEqual(results[3][1], D('1'))
+
+    def test_case_when_incompatible_types(self):
+        """Test CASE WHEN with incompatible types raises CompilationError."""
+        with self.assertRaises(compiler.CompilationError) as cm:
+            self.compile('''
+                SELECT
+                  CASE
+                    WHEN number > 100 THEN 'string'
+                    ELSE number
+                  END
+                FROM postings
+            ''')
+        self.assertIn('incompatible types', str(cm.exception))
+
+    def test_case_when_set_types(self):
+        """Test CASE WHEN with set types (tags, links).
+
+        Note: tags and links are both untyped 'set' columns. This tests
+        the same-type fast path for set types.
+        """
+        results = self.execute('''
+            SELECT
+              account,
+              CASE
+                WHEN account = 'Assets:Cash' THEN tags
+                ELSE links
+              END as tag_or_link
+            FROM postings
+            WHERE account = 'Assets:Cash'
+            LIMIT 1
+        ''')
+        # Should compile and execute without error
+        self.assertEqual(len(results), 1)
+
+    def test_case_when_set_and_typed_set(self):
+        """Test CASE WHEN with set and set[str] types (should be compatible).
+
+        Note: tags is 'set' (untyped), accounts is 'set[str]' (typed).
+        These are the only available column types to test the set + set[type] -> set
+        compatibility rule. No other typed set columns (e.g., set[int]) exist in the schema.
+        """
+        results = self.execute('''
+            SELECT
+              account,
+              CASE
+                WHEN account = 'Assets:Cash' THEN tags
+                ELSE accounts
+              END as result
+            FROM postings
+            WHERE account = 'Assets:Cash'
+            LIMIT 1
+        ''')
+        # tags is set, accounts is set[str] - should be compatible (-> set)
+        self.assertEqual(len(results), 1)
+
+    def test_case_when_typed_sets_same_inner_type(self):
+        """Test CASE WHEN with set[str] types (should be compatible).
+
+        Note: accounts is the only typed set column available (set[str]).
+        This tests the set[x] + set[x] -> set[x] compatibility rule.
+        The recursive set[x] + set[y] case cannot be tested as there are no
+        other typed set columns (e.g., set[int], set[Decimal]) in the schema.
+        """
+        # Both accounts columns are set[str], should be compatible
+        query = self.compile('''
+            SELECT
+              CASE
+                WHEN date > DATE('2010-01-01') THEN accounts
+                ELSE accounts
+              END
+            FROM postings
+        ''')
+        # Should compile without error
+        self.assertIsNotNone(query)
