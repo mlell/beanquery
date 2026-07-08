@@ -81,11 +81,22 @@ def node(name, fields):
 #   from_clause: An instance of 'From', or None if absent.
 #   where_clause: A root expression node, or None if absent.
 #   group_by: An instance of 'GroupBy', or None if absent.
-#   order_by: An instance of 'OrderBy', or None if absent.
-#   pivot_by: An instance of 'PivotBy', or None if absent.
-#   limit: An integer, or None is absent.
 #   distinct: A boolean value (True), or None if absent.
-Select = node('Select', 'targets from_clause where_clause group_by order_by pivot_by limit distinct')
+Select = node('Select', 'targets from_clause where_clause group_by distinct')
+
+# The top-level query node wrapping one or more SELECT bodies.
+#
+# A single SELECT is the degenerate case (len(queries) == 1).
+# In the future, UNION chain support will be added where len(queries) > 1.
+#
+# Attributes:
+#   queries:   List of Select nodes.
+#   set_operators: List of set-operator names between adjacent queries, e.g.
+#              'union' or 'union_all'.  len == len(queries) - 1.
+#   order_by:  Optional list of OrderBy applied to the combined result.
+#   limit:     Optional integer limit applied to the combined result.
+#   pivot_by:  Optional PivotBy applied to the combined result.
+Query = node('Query', 'queries set_operators order_by limit pivot_by')
 
 # A select query that produces final balances for accounts.
 # This is equivalent to
@@ -148,9 +159,43 @@ class From(Node):
 # A GROUP BY clause.
 #
 # Attributes:
-#   columns: A list of group-by expressions, simple Column() or otherwise.
+#   elements: An ordered list of grouping-element nodes (GroupColumn or
+#     GroupingSets).
 #   having: An expression tree for the optional HAVING clause, or None.
-GroupBy = node('GroupBy', 'columns having')
+GroupBy = node('GroupBy', 'elements having')
+
+# A plain column/expression/integer in a GROUP BY element list.
+#
+# Attributes:
+#   column: A column/expression node or a 1-based integer index.
+GroupColumn = node('GroupColumn', 'column')
+
+# A GROUPING SETS (...) element in a GROUP BY clause.
+#
+# Each set is a (possibly empty) list of column/expression/integer items.
+# An empty list represents the grand-total set.
+#
+# Attributes:
+#   sets: A list of lists; each inner list is one grouping set.
+GroupingSets = node('GroupingSets', 'sets')
+
+# A ROLLUP (...) element in a GROUP BY clause.
+#
+# ROLLUP(a, b, c) is equivalent to GROUPING SETS((a, b, c), (a, b), (a), ()).
+# It creates hierarchical subtotals from right to left.
+#
+# Attributes:
+#   columns: A list of column/expression/integer items.
+Rollup = node('Rollup', 'columns')
+
+# A CUBE (...) element in a GROUP BY clause.
+#
+# CUBE(a, b, c) is equivalent to GROUPING SETS((a, b, c), (a, b), (a, c), (b, c), (a), (b), (c), ()).
+# It creates all 2^N combinations of the columns (power set).
+#
+# Attributes:
+#   columns: A list of column/expression/integer items.
+Cube = node('Cube', 'columns')
 
 # An ORDER BY clause.
 #

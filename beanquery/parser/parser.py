@@ -25,37 +25,41 @@ from tatsu.util import re, generic_main
 
 
 KEYWORDS: set[str] = {
-    'DISTINCT',
-    'PIVOT',
-    'INTO',
-    'BALANCES',
     'USING',
     'DESC',
-    'AND',
-    'BY',
-    'INSERT',
-    'WHEN',
-    'TABLE',
+    'PRINT',
+    'LIMIT',
     'CASE',
-    'IS',
-    'FALSE',
-    'ORDER',
-    'OR',
-    'FROM',
+    'WHEN',
+    'BY',
+    'IN',
+    'PIVOT',
     'THEN',
     'NOT',
-    'SELECT',
-    'PRINT',
-    'IN',
-    'WHERE',
-    'ASC',
-    'GROUP',
-    'TRUE',
+    'AND',
+    'ROLLUP',
+    'ORDER',
+    'IS',
+    'INTO',
+    'CUBE',
+    'TABLE',
+    'OR',
+    'GROUPING',
     'AS',
-    'LIMIT',
-    'CREATE',
-    'JOURNAL',
     'HAVING',
+    'FALSE',
+    'INSERT',
+    'JOURNAL',
+    'SETS',
+    'BALANCES',
+    'TRUE',
+    'ASC',
+    'SELECT',
+    'FROM',
+    'CREATE',
+    'GROUP',
+    'WHERE',
+    'DISTINCT',
 }
 
 
@@ -108,7 +112,7 @@ class BQLParser(Parser):
     def _statement_(self):
         with self._choice():
             with self._option():
-                self._select_()
+                self._query_()
             with self._option():
                 self._balances_()
             with self._option():
@@ -122,10 +126,92 @@ class BQLParser(Parser):
             self._error(
                 'expecting one of: '
                 "'BALANCES' 'CREATE' 'INSERT' 'JOURNAL'"
-                "'PRINT' 'SELECT' <balances>"
-                '<create_table> <insert> <journal>'
-                '<print> <select>'
+                "'PRINT' <balances> <create_table>"
+                '<insert> <journal> <print> <query>'
+                '<select> <subquery>'
             )
+
+    @tatsumasu('Query')
+    def _query_(self):
+        with self._group():
+            with self._choice():
+                with self._option():
+                    self._select_()
+                with self._option():
+                    self._subquery_()
+                self._error(
+                    'expecting one of: '
+                    '<select> <subquery>'
+                )
+        self.add_last_node_to_name('queries')
+
+        def block0():
+            with self._group():
+                with self._choice():
+                    with self._option():
+                        self._token('UNION')
+                        self._token('ALL')
+                        self._constant('union_all')
+                        self.add_last_node_to_name('set_operators')
+                        self._define(
+                            [],
+                            ['set_operators'],
+                        )
+                    with self._option():
+                        self._token('UNION')
+                        self._constant('union')
+                        self.add_last_node_to_name('set_operators')
+                        self._define(
+                            [],
+                            ['set_operators'],
+                        )
+                    self._error(
+                        'expecting one of: '
+                        "'UNION'"
+                    )
+            with self._group():
+                with self._choice():
+                    with self._option():
+                        self._select_()
+                    with self._option():
+                        self._subquery_()
+                    self._error(
+                        'expecting one of: '
+                        '<select> <subquery>'
+                    )
+            self.add_last_node_to_name('queries')
+            self._define(
+                [],
+                ['queries', 'set_operators'],
+            )
+        self._closure(block0)
+        with self._optional():
+            self._token('ORDER')
+            self._token('BY')
+
+            def sep1():
+                self._token(',')
+
+            def block2():
+                self._order_()
+            self._positive_gather(block2, sep1)
+            self.name_last_node('order_by')
+            self._define(['order_by'], [])
+        with self._optional():
+            self._token('LIMIT')
+            self._integer_()
+            self.name_last_node('limit')
+            self._define(['limit'], [])
+        with self._optional():
+            self._token('PIVOT')
+            self._token('BY')
+            self._pivotby_()
+            self.name_last_node('pivot_by')
+            self._define(['pivot_by'], [])
+        self._define(
+            ['limit', 'order_by', 'pivot_by'],
+            ['queries', 'set_operators'],
+        )
 
     @tatsumasu('Select')
     def _select_(self):
@@ -159,12 +245,12 @@ class BQLParser(Parser):
                     with self._option():
                         self.__table_()
                     with self._option():
-                        self._subselect_()
+                        self._subquery_()
                     with self._option():
                         self._from_()
                     self._error(
                         'expecting one of: '
-                        '<_table> <from> <subselect>'
+                        '<_table> <from> <subquery>'
                     )
             self.name_last_node('from_clause')
             self._define(['from_clause'], [])
@@ -179,35 +265,12 @@ class BQLParser(Parser):
             self._groupby_()
             self.name_last_node('group_by')
             self._define(['group_by'], [])
-        with self._optional():
-            self._token('ORDER')
-            self._token('BY')
-
-            def sep2():
-                self._token(',')
-
-            def block3():
-                self._order_()
-            self._positive_gather(block3, sep2)
-            self.name_last_node('order_by')
-            self._define(['order_by'], [])
-        with self._optional():
-            self._token('PIVOT')
-            self._token('BY')
-            self._pivotby_()
-            self.name_last_node('pivot_by')
-            self._define(['pivot_by'], [])
-        with self._optional():
-            self._token('LIMIT')
-            self._integer_()
-            self.name_last_node('limit')
-            self._define(['limit'], [])
-        self._define(['distinct', 'from_clause', 'group_by', 'limit', 'order_by', 'pivot_by', 'targets', 'where_clause'], [])
+        self._define(['distinct', 'from_clause', 'group_by', 'targets', 'where_clause'], [])
 
     @tatsumasu()
-    def _subselect_(self):
+    def _subquery_(self):
         self._token('(')
-        self._select_()
+        self._query_()
         self.name_last_node('@')
         self._token(')')
 
@@ -345,6 +408,74 @@ class BQLParser(Parser):
             self._token(',')
 
         def block1():
+            self._grouping_element_()
+        self._positive_gather(block1, sep0)
+        self.name_last_node('elements')
+        with self._optional():
+            self._token('HAVING')
+            self._expression_()
+            self.name_last_node('having')
+            self._define(['having'], [])
+        self._define(['elements', 'having'], [])
+
+    @tatsumasu()
+    def _grouping_element_(self):
+        with self._choice():
+            with self._option():
+                self._grouping_sets_()
+            with self._option():
+                self._rollup_()
+            with self._option():
+                self._cube_()
+            with self._option():
+                self._group_column_()
+            self._error(
+                'expecting one of: '
+                "'CUBE' 'GROUPING' 'ROLLUP' <cube>"
+                '<expression> <group_column>'
+                '<grouping_sets> <integer> <rollup>'
+            )
+
+    @tatsumasu('GroupColumn')
+    def _group_column_(self):
+        with self._group():
+            with self._choice():
+                with self._option():
+                    self._integer_()
+                with self._option():
+                    self._expression_()
+                self._error(
+                    'expecting one of: '
+                    '<conjunction> <disjunction> <expression>'
+                    '<integer> [0-9]+'
+                )
+        self.name_last_node('column')
+
+    @tatsumasu('GroupingSets')
+    def _grouping_sets_(self):
+        self._token('GROUPING')
+        self._token('SETS')
+        self._token('(')
+
+        def sep0():
+            self._token(',')
+
+        def block1():
+            self._grouping_set_()
+        self._gather(block1, sep0)
+        self.name_last_node('sets')
+        self._token(')')
+        self._define(['sets'], [])
+
+    @tatsumasu('Rollup')
+    def _rollup_(self):
+        self._token('ROLLUP')
+        self._token('(')
+
+        def sep0():
+            self._token(',')
+
+        def block1():
             with self._group():
                 with self._choice():
                     with self._option():
@@ -355,14 +486,56 @@ class BQLParser(Parser):
                         'expecting one of: '
                         '<expression> <integer>'
                     )
-        self._positive_gather(block1, sep0)
+        self._gather(block1, sep0)
         self.name_last_node('columns')
-        with self._optional():
-            self._token('HAVING')
-            self._expression_()
-            self.name_last_node('having')
-            self._define(['having'], [])
-        self._define(['columns', 'having'], [])
+        self._token(')')
+        self._define(['columns'], [])
+
+    @tatsumasu('Cube')
+    def _cube_(self):
+        self._token('CUBE')
+        self._token('(')
+
+        def sep0():
+            self._token(',')
+
+        def block1():
+            with self._group():
+                with self._choice():
+                    with self._option():
+                        self._integer_()
+                    with self._option():
+                        self._expression_()
+                    self._error(
+                        'expecting one of: '
+                        '<expression> <integer>'
+                    )
+        self._gather(block1, sep0)
+        self.name_last_node('columns')
+        self._token(')')
+        self._define(['columns'], [])
+
+    @tatsumasu()
+    def _grouping_set_(self):
+        self._token('(')
+
+        def sep0():
+            self._token(',')
+
+        def block1():
+            with self._group():
+                with self._choice():
+                    with self._option():
+                        self._integer_()
+                    with self._option():
+                        self._expression_()
+                    self._error(
+                        'expecting one of: '
+                        '<expression> <integer>'
+                    )
+        self._gather(block1, sep0)
+        self.name_last_node('@')
+        self._token(')')
 
     @tatsumasu('OrderBy')
     def _order_(self):
@@ -594,11 +767,41 @@ class BQLParser(Parser):
                 self._op_()
                 self.name_last_node('op')
                 self._token('any')
+                with self._if():
+                    with self._group():
+                        self._token('(')
+                        self._token('SELECT')
+                self._subquery_()
+                self.name_last_node('right')
+                self._constant('rhs')
+                self.name_last_node('side')
+                self._define(['left', 'op', 'right', 'side'], [])
+            with self._option():
+                self._sum_()
+                self.name_last_node('left')
+                self._op_()
+                self.name_last_node('op')
+                self._token('any')
                 self._token('(')
                 self._expression_()
                 self.name_last_node('right')
                 self._token(')')
                 self._constant('rhs')
+                self.name_last_node('side')
+                self._define(['left', 'op', 'right', 'side'], [])
+            with self._option():
+                self._token('any')
+                with self._if():
+                    with self._group():
+                        self._token('(')
+                        self._token('SELECT')
+                self._subquery_()
+                self.name_last_node('left')
+                self._op_()
+                self.name_last_node('op')
+                self._sum_()
+                self.name_last_node('right')
+                self._constant('lhs')
                 self.name_last_node('side')
                 self._define(['left', 'op', 'right', 'side'], [])
             with self._option():
@@ -628,11 +831,41 @@ class BQLParser(Parser):
                 self._op_()
                 self.name_last_node('op')
                 self._token('all')
+                with self._if():
+                    with self._group():
+                        self._token('(')
+                        self._token('SELECT')
+                self._subquery_()
+                self.name_last_node('right')
+                self._constant('rhs')
+                self.name_last_node('side')
+                self._define(['left', 'op', 'right', 'side'], [])
+            with self._option():
+                self._sum_()
+                self.name_last_node('left')
+                self._op_()
+                self.name_last_node('op')
+                self._token('all')
                 self._token('(')
                 self._expression_()
                 self.name_last_node('right')
                 self._token(')')
                 self._constant('rhs')
+                self.name_last_node('side')
+                self._define(['left', 'op', 'right', 'side'], [])
+            with self._option():
+                self._token('all')
+                with self._if():
+                    with self._group():
+                        self._token('(')
+                        self._token('SELECT')
+                self._subquery_()
+                self.name_last_node('left')
+                self._op_()
+                self.name_last_node('op')
+                self._sum_()
+                self.name_last_node('right')
+                self._constant('lhs')
                 self.name_last_node('side')
                 self._define(['left', 'op', 'right', 'side'], [])
             with self._option():
@@ -954,9 +1187,9 @@ class BQLParser(Parser):
                 self._atom_()
             self._error(
                 'expecting one of: '
-                "'SELECT' <atom> <attribute> <case_expr>"
+                "'(' <atom> <attribute> <case_expr>"
                 '<column> <constant> <function>'
-                '<placeholder> <primary> <select>'
+                '<placeholder> <primary> <subquery>'
                 '<subscript>'
             )
 
@@ -987,7 +1220,7 @@ class BQLParser(Parser):
             with self._option():
                 self._case_expr_()
             with self._option():
-                self._select_()
+                self._subquery_()
             with self._option():
                 self._function_()
             with self._option():
@@ -998,11 +1231,11 @@ class BQLParser(Parser):
                 self._placeholder_()
             self._error(
                 'expecting one of: '
-                "'%(' '%s' 'CASE' 'SELECT' <boolean>"
+                "'%(' '%s' '(' 'CASE' <boolean>"
                 '<case_expr> <column> <constant> <date>'
                 '<decimal> <function> <identifier>'
                 '<integer> <list> <literal> <null>'
-                '<placeholder> <select> <string>'
+                '<placeholder> <string> <subquery>'
             )
 
     @tatsumasu('WhenClause')
@@ -1303,7 +1536,7 @@ class BQLParser(Parser):
                     self._define(['using'], [])
                 with self._option():
                     self._token('AS')
-                    self._select_()
+                    self._query_()
                     self.name_last_node('query')
                     self._define(['query'], [])
                 self._error(

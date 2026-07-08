@@ -2,8 +2,8 @@
 @@parseinfo :: True
 @@ignorecase :: True
 @@keyword :: 'AND' 'AS' 'ASC' 'BY' 'CASE' 'DESC' 'DISTINCT' 'FALSE' 'FROM'
-    'GROUP' 'HAVING' 'IN' 'IS' 'LIMIT' 'NOT' 'OR' 'ORDER' 'PIVOT'
-    'SELECT' 'THEN' 'TRUE' 'WHEN' 'WHERE'
+    'GROUP' 'GROUPING' 'HAVING' 'IN' 'IS' 'LIMIT' 'NOT' 'OR' 'ORDER' 'PIVOT'
+    'ROLLUP' 'CUBE' 'SELECT' 'SETS' 'THEN' 'TRUE' 'WHEN' 'WHERE'
 @@keyword :: 'CREATE' 'TABLE' 'USING' 'INSERT' 'INTO'
 @@keyword :: 'BALANCES' 'JOURNAL' 'PRINT'
 @@comments :: /(\/\*([^*]|[\r\n]|(\*+([^*\/]|[\r\n])))*\*+\/)/
@@ -15,7 +15,7 @@ bql
 
 statement
     =
-    | select
+    | query
     | balances
     | journal
     | print
@@ -23,18 +23,34 @@ statement
     | insert
     ;
 
-select::Select
-    = 'SELECT' ['DISTINCT' distinct:`True`] targets:(','.{ target }+ | asterisk)
-      ['FROM' from_clause:(_table | subselect | from)]
-      ['WHERE' where_clause:expression]
-      ['GROUP' 'BY' group_by:groupby]
+(* Wrapper for queries, which can be either a plain SELECT or a chain of
+   SELECTs combined by set operators (UNION, UNION ALL).  ORDER BY, LIMIT,
+   and PIVOT BY after the last operand apply to the combined result set.
+   The list `operators` has one entry per inter-operand connector, always one
+   less than the number of queries. *)
+query::Query
+    = queries+:( select | subquery )
+      { ( 'UNION' 'ALL' set_operators+:`'union_all'`
+        | 'UNION'       set_operators+:`'union'`
+        ) queries+:( select | subquery)
+      }*
       ['ORDER' 'BY' order_by:','.{order}+]
-      ['PIVOT' 'BY' pivot_by:pivotby]
       ['LIMIT' limit:integer]
+      ['PIVOT' 'BY' pivot_by:pivotby]
     ;
 
-subselect
-    = '(' @:select ')'
+(* SELECT body without ORDER BY / LIMIT / PIVOT BY so the enclosing query rule can claim
+   those tokens for the combined result set. *)
+select::Select
+    = 'SELECT' ['DISTINCT' distinct:`True`] targets:(','.{ target }+ | asterisk)
+      ['FROM' from_clause:(_table | subquery | from)]
+      ['WHERE' where_clause:expression]
+      ['GROUP' 'BY' group_by:groupby]
+    ;
+
+(* Parenthesised sub-query; uses query so ORDER BY / LIMIT are allowed inside. *)
+subquery
+    = '(' @:query ')'
     ;
 
 from::From
@@ -56,7 +72,40 @@ table::Table
     ;
 
 groupby::GroupBy
-    = columns:','.{ (integer | expression) }+ ['HAVING' having:expression]
+    = elements:','.{ grouping_element }+ ['HAVING' having:expression]
+    ;
+
+(* A simple column or an expression like GROUPING SETS(...), ROLLUP(...) or CUBE(...) *)
+grouping_element
+    =
+    | grouping_sets
+    | rollup
+    | cube
+    | group_column
+    ;
+
+(* A simple grouing column *)
+group_column::GroupColumn
+    = column:(integer | expression)
+    ;
+
+(* A GROUPING SETS(...) element *)
+grouping_sets::GroupingSets
+    = 'GROUPING' 'SETS' '(' sets:','.{ grouping_set } ')'
+    ;
+
+(* A ROLLUP(...) element *)
+rollup::Rollup
+    = 'ROLLUP' '(' columns:','.{ (integer | expression) } ')'
+    ;
+
+(* A CUBE(...) element *)
+cube::Cube
+    = 'CUBE' '(' columns:','.{ (integer | expression) } ')'
+    ;
+
+grouping_set
+    = '(' @:','.{ (integer | expression) } ')'
     ;
 
 order::OrderBy
@@ -132,15 +181,23 @@ comparison
     | sum
     ;
 
+(* This operator is special in that it has parentheses. Avoid double parentheses
+with subquerys ALL( (SELECT ...) ) by &(...) look-ahead *)
 any::Any
     =
+    | left:sum op:op 'any' &('(' 'SELECT') right:subquery side:`rhs`
     | left:sum op:op 'any' '(' right:expression ')' side:`rhs`
+    | 'any' &('(' 'SELECT' ) left:subquery op:op right:sum side:`lhs`
     | 'any' '(' left:expression ')' op:op right:sum side:`lhs`
     ;
 
+(* This operator is special in that it has parentheses. Avoid double parentheses
+with subquerys ALL( (SELECT ...) ) by &(...) look-ahead *)
 all::All
     =
+    | left:sum op:op 'all' &('(' 'SELECT') right:subquery side:`rhs`
     | left:sum op:op 'all' '(' right:expression ')' side:`rhs`
+    | 'all' &('(' 'SELECT' ) left:subquery op:op right:sum side:`lhs`
     | 'all' '(' left:expression ')' op:op right:sum side:`lhs`
     ;
 
@@ -287,7 +344,7 @@ subscript::Subscript
 atom
     =
     | case_expr
-    | select
+    | subquery
     | function
     | constant
     | column
@@ -405,7 +462,7 @@ create_table::CreateTable
       (
       | '(' columns:','.{( identifier identifier )} ')' ['USING' using:string]
       | 'USING' using:string
-      | 'AS' query:select
+      | 'AS' query:query
       )
     ;
 

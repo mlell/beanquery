@@ -12,6 +12,7 @@ from beancount.core.amount import from_string as A
 from beancount.core.number import D
 from beancount.core import inventory
 from beancount.core.inventory import from_string as I
+from beanquery.parser import ast
 from beancount.parser import cmptest
 from beancount.utils.test_utils import docfile
 from beancount import loader
@@ -512,8 +513,8 @@ class TestFilterEntries(CommonInputBase, QueryBase):
     @staticmethod
     def filter_entries(query):
         entries = []
-        expr = query.c_where
-        for entry in query.table:
+        expr = query.select.c_where
+        for entry in query.select.table:
             if expr is None or expr(entry):
                 entries.append(entry)
         return entries
@@ -788,7 +789,7 @@ class TestExecuteNonAggregatedQuery(QueryBase):
                 ])
 
 
-class TestExecuteAggregatedQuery(QueryBase):
+class TestExecuteSimpleAggregatedQuery(QueryBase):
 
     INPUT = """
 
@@ -1110,6 +1111,416 @@ class TestExecuteAggregatedQuery(QueryBase):
             [
                 ('Expenses:Bar', D(2.0)),
                 ('Expenses:Foo', D(1.0)),
+            ])
+
+
+class TestExecuteGroupingSets(QueryBase):
+
+    # 3 accounts * 2 years gives enough variety to check NULL markers,
+    # subtotals, and grand totals without being unwieldy.
+    INPUT = """
+      2020-01-01 open Assets:Cash
+      2020-01-01 open Expenses:Food
+      2020-01-01 open Expenses:Transport
+
+      2020-03-01 * "Food 2020 No 1"
+        Expenses:Food         5.00 USD
+        Assets:Cash
+
+      2020-03-01 * "Food 2020 No 2"
+        Expenses:Food         5.00 USD
+        Assets:Cash
+
+      2020-06-01 * "Transport 2020 No 1"
+        Expenses:Transport   10.00 USD
+        Assets:Cash
+
+      2020-06-01 * "Transport 2020 No 2"
+        Expenses:Transport   10.00 USD
+        Assets:Cash
+
+      2021-03-01 * "Food 2021 No 1"
+        Expenses:Food        15.00 USD
+        Assets:Cash
+
+      2021-03-01 * "Food 2021 No 2"
+        Expenses:Food        15.00 USD
+        Assets:Cash
+
+      2021-06-01 * "Transport 2021 No 1"
+        Expenses:Transport   20.00 USD
+        Assets:Cash
+
+      2021-06-01 * "Transport 2021 No 2"
+        Expenses:Transport   20.00 USD
+        Assets:Cash
+    """
+
+    def test_grouping_sets_single_column(self):
+        # Single GROUPING SETS on account: each set groups by one column,
+        # NULL appears in the other column's position in the complementary set.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ())
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                ('Expenses:Food',  D('40.00')),
+                ('Expenses:Transport', D('60.00')),
+                (None,             D('100.00')),
+            ])
+
+    def test_grouping_sets_two_columns(self):
+        # Two-column grouping sets: (account, year) and (account) and ().
+        # NULL markers appear for the absent grouping column in each row.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account, yr), (account))
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+            ])
+
+    def test_grouping_sets_empty_set_grand_total(self):
+        # An empty grouping set () produces the grand-total row (all NULLs
+        # for non-aggregate columns).
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ())
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                ('Expenses:Food',      D('40.00')),
+                ('Expenses:Transport', D('60.00')),
+                (None,                 D('100.00')),
+            ])
+
+    def test_grouping_sets_mixed_plain_prefix(self):
+        # Plain column prefix combined with GROUPING SETS: the prefix column
+        # is grouped in every set, the GROUPING SETS column varies.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY account, GROUPING SETS ((yr), ())
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+            ])
+
+    def test_grouping_sets_two_grouping_sets_elements(self):
+        # Two GROUPING SETS elements: cartesian product produces 2*2 = 4 sets.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ()),
+                     GROUPING SETS ((yr), ())            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+                (None,                 2020, D('30.00')),
+                (None,                 2021, D('70.00')),
+                (None,                 None, D('100.00')),
+            ])
+
+    def test_grouping_sets_with_order_by_and_limit(self):
+        # ORDER BY and LIMIT apply to the combined UNION ALL result.
+        # Grand-total row (account=NULL, total=100.00) sorts first DESC.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ())
+            ORDER BY total DESC
+            LIMIT 2
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                (None,                 D('100.00')),
+                ('Expenses:Transport', D('60.00')),
+            ])
+
+    def test_grouping_sets_with_having(self):
+        # HAVING filters within each set independently.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account), ())
+            HAVING sum(number) > 50.00
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                ('Expenses:Transport', D('60.00')),
+                (None,                 D('100.00')),
+            ])
+
+    def test_grouping_sets_with_pivot_by(self):
+        # PIVOT BY requires its second column to be in the intersection of all
+        # per-set group indexes.  Sets (account, yr) and (yr) have intersection
+        # {yr}, so PIVOT BY account, yr is valid (yr is the second column).
+        # Rows grouped only by yr (account=NULL) provide the column-total cells.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account, yr), (yr))
+            PIVOT BY account, yr
+            """,
+            [
+                ('account/yr', str),
+                ('2020', Decimal),
+                ('2021', Decimal),
+            ],
+            [
+                (None,                 D('30.00'), D('70.00')),
+                ('Expenses:Food',      D('10.00'), D('30.00')),
+                ('Expenses:Transport', D('20.00'), D('40.00')),
+            ])
+
+    def test_rollup_single_column(self):
+        # ROLLUP on a single column is equivalent to GROUPING SETS ((a), ())
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account)
+            """,
+            [('account', str), ('total', Decimal)],
+            [
+                ('Expenses:Food',      D('40.00')),
+                ('Expenses:Transport', D('60.00')),
+                (None,                 D('100.00')),
+            ])
+
+    def test_rollup_two_columns(self):
+        # ROLLUP(a, b) desugars to GROUPING SETS ((a, b), (a), ())
+        # Creates hierarchical subtotals from right to left.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account, yr)
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+                (None,                 None, D('100.00')),
+            ])
+
+    def test_rollup_three_columns(self):
+        # ROLLUP(a, b, c) desugars to GROUPING SETS ((a, b, c), (a, b), (a), ())
+        # Creates hierarchical subtotals from right to left.
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, month(date) AS mo, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account, yr, mo)
+            """,
+            [('account', str), ('yr', int), ('mo', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, 3,  D('10.00')),
+                ('Expenses:Transport', 2020, 6,  D('20.00')),
+                ('Expenses:Food',      2021, 3,  D('30.00')),
+                ('Expenses:Transport', 2021, 6,  D('40.00')),
+                ('Expenses:Food',      2020, None, D('10.00')),
+                ('Expenses:Transport', 2020, None, D('20.00')),
+                ('Expenses:Food',      2021, None, D('30.00')),
+                ('Expenses:Transport', 2021, None, D('40.00')),
+                ('Expenses:Food',      None, None, D('40.00')),
+                ('Expenses:Transport', None, None, D('60.00')),
+                (None,                 None, None, D('100.00')),
+            ])
+
+    def test_mixed_plain_and_rollup(self):
+        # GROUP BY a, ROLLUP(b) computes cross-product:
+        # a -> [[a]]
+        # ROLLUP(b) -> [[a, b], [a]]
+        # Cross-product: [[a, b], [a]]
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY account, ROLLUP (yr)
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+            ])
+
+    def test_mixed_grouping_sets_and_rollup(self):
+        # GROUP BY GROUPING SETS((a, b)), ROLLUP(c) computes cross-product of elements:
+        # GROUPING SETS((a, b)) -> [[a, b]]
+        # ROLLUP(c) -> [[c], []]
+        # Cross-product: [[a, b, c], [a, b]]
+        # NOT: [[a, b, c], [a, b], [a, b]] (would have duplicate [a, b])
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, month(date) AS mo, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY GROUPING SETS ((account, yr)), ROLLUP (mo)
+            """,
+            [('account', str), ('yr', int), ('mo', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, 3,  D('10.00')),
+                ('Expenses:Transport', 2020, 6,  D('20.00')),
+                ('Expenses:Food',      2021, 3,  D('30.00')),
+                ('Expenses:Transport', 2021, 6,  D('40.00')),
+                ('Expenses:Food',      2020, None, D('10.00')),
+                ('Expenses:Transport', 2020, None, D('20.00')),
+                ('Expenses:Food',      2021, None, D('30.00')),
+                ('Expenses:Transport', 2021, None, D('40.00')),
+            ])
+
+    def test_rollup_with_pivot_by(self):
+
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account, yr)
+            PIVOT BY account, yr
+            """,
+            [
+                ('account/yr', str),
+                ('2020', Decimal),
+                ('2021', Decimal),
+                ('NULL', Decimal),
+            ],
+            [
+                (None,                 None,       None,       D('100.00')),
+                ('Expenses:Food',      D('10.00'), D('30.00'), D('40.00')),
+                ('Expenses:Transport', D('20.00'), D('40.00'), D('60.00')),
+            ])
+
+    def test_rollup_with_pivot_by_inverted(self):
+        # Same ROLLUP as above but PIVOT BY yr, account (row=yr, pivot=account).
+        # ROLLUP(account, yr) sets: (account,yr), (account), ().
+        # yr=2020: Food=10, Transport=20; yr=2021: Food=30, Transport=40.
+        # yr=None: Food=40 (from (account) set), Transport=60, NULL=100 (from () set).
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY ROLLUP (account, yr)
+            PIVOT BY yr, account
+            """,
+            [
+                ('yr/account', int),
+                ('Expenses:Food', Decimal),
+                ('Expenses:Transport', Decimal),
+                ('NULL', Decimal),
+            ],
+            [
+                (None, D('40.00'), D('60.00'), D('100.00')),
+                (2020, D('10.00'), D('20.00'), None),
+                (2021, D('30.00'), D('40.00'), None),
+            ])
+
+    def test_cube_two_columns(self):
+        # CUBE(a, b) desugars to GROUPING SETS((a, b), (a), (b), ())
+        # Creates all 2^2 = 4 combinations
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY CUBE (account, yr)
+            """,
+            [('account', str), ('yr', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, D('10.00')),
+                ('Expenses:Transport', 2020, D('20.00')),
+                ('Expenses:Food',      2021, D('30.00')),
+                ('Expenses:Transport', 2021, D('40.00')),
+                ('Expenses:Food',      None, D('40.00')),
+                ('Expenses:Transport', None, D('60.00')),
+                (None,                 2020, D('30.00')),
+                (None,                 2021, D('70.00')),
+                (None,                 None, D('100.00')),
+            ])
+
+    def test_cube_three_columns(self):
+        # CUBE(a, b, c) desugars to GROUPING SETS with all 2^3 = 8 combinations
+        self.check_query(
+            self.INPUT,
+            """
+            SELECT account, year(date) AS yr, month(date) AS mo, sum(number) AS total
+            WHERE account ~ 'Expenses'
+            GROUP BY CUBE (account, yr, mo)
+            """,
+            [('account', str), ('yr', int), ('mo', int), ('total', Decimal)],
+            [
+                ('Expenses:Food',      2020, 3,  D('10.00')),
+                ('Expenses:Transport', 2020, 6,  D('20.00')),
+                ('Expenses:Food',      2021, 3,  D('30.00')),
+                ('Expenses:Transport', 2021, 6,  D('40.00')),
+                ('Expenses:Food',      2020, None, D('10.00')),
+                ('Expenses:Transport', 2020, None, D('20.00')),
+                ('Expenses:Food',      2021, None, D('30.00')),
+                ('Expenses:Transport', 2021, None, D('40.00')),
+                ('Expenses:Food',      None, 3,  D('40.00')),
+                ('Expenses:Transport', None, 6,  D('60.00')),
+                (None,                 2020, 3,  D('10.00')),
+                (None,                 2020, 6,  D('20.00')),
+                (None,                 2021, 3,  D('30.00')),
+                (None,                 2021, 6,  D('40.00')),
+                ('Expenses:Food',      None, None, D('40.00')),
+                ('Expenses:Transport', None, None, D('60.00')),
+                (None,                 2020, None, D('30.00')),
+                (None,                 2021, None, D('70.00')),
+                (None,                 None, 3,  D('40.00')),
+                (None,                 None, 6,  D('60.00')),
+                (None,                 None, None, D('100.00')),
             ])
 
 
@@ -1881,3 +2292,364 @@ class TestCSVSource(unittest.TestCase):
         self.assertEqual(names, ['id', 'name', 'check', 'date', 'value'])
         types = [column.dtype for column in conn.tables['test'].columns.values()]
         self.assertEqual(types, [int, str, bool, datetime.date, Decimal])
+
+
+class FakeQuery:
+    """Minimal query stub that returns fixed (columns, rows) without any SQL."""
+
+    def __init__(self, columns, rows):
+        self._columns = columns
+        self._rows = rows
+
+    @property
+    def columns(self):
+        return self._columns
+
+    @property
+    def c_targets(self):
+        return self._columns
+
+    def __call__(self):
+        return self._columns, list(self._rows)
+
+
+class TestEvalUnion(unittest.TestCase):
+    """Unit tests for EvalUnion.__call__ in isolation from the parser/compiler.
+
+    EvalUnion returns (result_types, rows, visible_mask) like EvalSelect.
+    ORDER BY and LIMIT are handled by wrapping EvalUnion in EvalQuery.
+    """
+
+    COL_N = qc.EvalTarget(qc.EvalConstant(None, int), 'n', False)
+    COL_A = qc.EvalTarget(qc.EvalConstant(None, int), 'a', False)
+    COL_B = qc.EvalTarget(qc.EvalConstant(None, str), 'b', False)
+
+    def _union(self, queries, set_operators, c_targets=None):
+        """Create an EvalUnion. For ORDER BY/LIMIT tests, wrap in EvalQuery."""
+        if c_targets is None:
+            c_targets = [self.COL_N]
+        return qc.EvalUnion(
+            queries=queries,
+            set_operators=set_operators,
+        )
+
+    def _query(self, queries, set_operators, c_targets=None, order_spec=None, limit=None):
+        """Create an EvalQuery wrapping an EvalUnion for ORDER BY/LIMIT tests."""
+        union = self._union(queries, set_operators, c_targets)
+        return qc.EvalQuery(
+            select=union,
+            order_spec=order_spec or [],
+            limit=limit,
+        )
+
+    # -- columns property --
+
+    def test_columns_returns_visible_targets(self):
+        """EvalUnion.columns should return targets with non-None names."""
+        invisible = qc.EvalTarget(qc.EvalConstant(None, int), None, False)
+        visible = qc.EvalTarget(qc.EvalConstant(None, int), 'n', False)
+        q1 = FakeQuery([visible], [(1,)])
+        u = self._union([q1], [], c_targets=[invisible, visible])
+        self.assertEqual(u.columns, [visible])
+
+    # -- row concatenation and deduplication --
+
+    def test_union_all_concatenates_without_deduplication(self):
+        """Given two queries sharing a duplicate row,
+        UNION ALL should return all rows from both queries
+        including the duplicate."""
+        q1 = FakeQuery([self.COL_N], [(1,), (2,)])
+        q2 = FakeQuery([self.COL_N], [(2,), (3,)])
+        _, rows, _ = self._union([q1, q2], ['union_all'])()
+        self.assertEqual(rows, [(1,), (2,), (2,), (3,)])
+
+    def test_union_removes_duplicates_preserving_first_seen_order(self):
+        """Given two queries sharing a duplicate row,
+        UNION should deduplicate while keeping
+        the order in which rows were first encountered."""
+        q1 = FakeQuery([self.COL_N], [(1,), (2,)])
+        q2 = FakeQuery([self.COL_N], [(2,), (3,)])
+        _, rows, _ = self._union([q1, q2], ['union'])()
+        self.assertEqual(rows, [(1,), (2,), (3,)])
+
+    # -- mixed UNION / UNION ALL chains --
+
+    def test_union_then_union_all_deduplicates_first_pair_only(self):
+        """Given A UNION B UNION ALL C where A=B=C=(1,),
+        the UNION between A and B should collapse them to one row,
+        then UNION ALL should append C's row unchanged,
+        yielding two rows of (1,)."""
+        q1 = FakeQuery([self.COL_N], [(1,)])
+        q2 = FakeQuery([self.COL_N], [(1,)])
+        q3 = FakeQuery([self.COL_N], [(1,)])
+        _, rows, _ = self._union([q1, q2, q3], ['union', 'union_all'])()
+        self.assertEqual(rows, [(1,), (1,)])
+
+    def test_union_all_then_union_deduplicates_all_accumulated_rows(self):
+        """Given A UNION ALL B UNION C where A=B=(1,) and C=(2,),
+        UNION ALL should keep the duplicate (1,) from A and B,
+        then the final UNION should deduplicate the entire accumulated set,
+        yielding one (1,) and one (2,)."""
+        q1 = FakeQuery([self.COL_N], [(1,)])
+        q2 = FakeQuery([self.COL_N], [(1,)])
+        q3 = FakeQuery([self.COL_N], [(2,)])
+        _, rows, _ = self._union([q1, q2, q3], ['union_all', 'union'])()
+        self.assertEqual(rows, [(1,), (2,)])
+
+    # -- ORDER BY (via EvalQuery wrapper) --
+
+    def test_order_by_asc_sorts_ascending(self):
+        """Given unsorted rows and order_spec [(0, ASC)],
+        EvalQuery wrapping EvalUnion should return rows sorted ascending."""
+        q1 = FakeQuery([self.COL_N], [(3,), (1,), (2,)])
+        _, rows = self._query([q1], [], order_spec=[(0, ast.Ordering.ASC)])()
+        self.assertEqual(rows, [(1,), (2,), (3,)])
+
+    def test_order_by_desc_sorts_descending(self):
+        """Given unsorted rows and order_spec [(0, DESC)],
+        EvalQuery wrapping EvalUnion should return rows sorted descending."""
+        q1 = FakeQuery([self.COL_N], [(1,), (3,), (2,)])
+        _, rows = self._query([q1], [], order_spec=[(0, ast.Ordering.DESC)])()
+        self.assertEqual(rows, [(3,), (2,), (1,)])
+
+    def test_order_by_non_first_column(self):
+        """Given two-column rows and order_spec [(1, ASC)],
+        EvalQuery should sort by the second column."""
+        q1 = FakeQuery([self.COL_A, self.COL_B], [(1, 'b'), (2, 'a')])
+        _, rows = self._query([q1], [], c_targets=[self.COL_A, self.COL_B],
+                              order_spec=[(1, ast.Ordering.ASC)])()
+        self.assertEqual(rows, [(2, 'a'), (1, 'b')])
+
+    # -- LIMIT (via EvalQuery wrapper) --
+
+    def test_limit_truncates_result(self):
+        """Given three rows and limit=2,
+        EvalQuery wrapping EvalUnion should return only the first two rows."""
+        q1 = FakeQuery([self.COL_N], [(1,), (2,), (3,)])
+        _, rows = self._query([q1], [], limit=2)()
+        self.assertEqual(rows, [(1,), (2,)])
+
+    def test_limit_none_returns_all_rows(self):
+        """Given limit=None, EvalQuery should not truncate the result."""
+        q1 = FakeQuery([self.COL_N], [(1,), (2,), (3,)])
+        _, rows = self._query([q1], [], limit=None)()
+        self.assertEqual(len(rows), 3)
+
+    def test_order_by_desc_with_limit_returns_top_n(self):
+        """Given three queries yielding 1, 2, 3, ORDER BY 1 DESC LIMIT 2
+        should return the two largest values in descending order."""
+        q1 = FakeQuery([self.COL_N], [(1,)])
+        q2 = FakeQuery([self.COL_N], [(2,)])
+        q3 = FakeQuery([self.COL_N], [(3,)])
+        _, rows = self._query(
+            [q1, q2, q3], ['union_all', 'union_all'],
+            order_spec=[(0, ast.Ordering.DESC)],
+            limit=2,
+        )()
+        self.assertEqual(rows, [(3,), (2,)])
+
+    # -- result_types passthrough --
+
+    def test_call_returns_result_types_from_c_targets(self):
+        """__call__ should return result_types derived from c_targets."""
+        q1 = FakeQuery([self.COL_A, self.COL_B], [(1, 'x')])
+        q2 = FakeQuery([self.COL_A, self.COL_B], [(2, 'y')])
+        result_types, _, _ = self._union([q1, q2], ['union_all'],
+                                          c_targets=[self.COL_A, self.COL_B])()
+        self.assertEqual(len(result_types), 2)
+        self.assertEqual(result_types[0].name, 'a')
+        self.assertEqual(result_types[1].name, 'b')
+
+    # -- edge cases --
+
+    def test_empty_subquery_contributes_no_rows(self):
+        """Given one empty and one non-empty sub-query joined by UNION ALL,
+        the empty sub-query should contribute nothing to the result."""
+        q1 = FakeQuery([self.COL_N], [])
+        q2 = FakeQuery([self.COL_N], [(1,)])
+        _, rows, _ = self._union([q1, q2], ['union_all'])()
+        self.assertEqual(rows, [(1,)])
+
+
+class TestUnion(QueryBase):
+    INPUT = """
+        2022-01-01 open Assets:Bank
+        2022-01-01 open Expenses:Food
+        2022-01-01 open Expenses:Transport
+
+        2022-01-15 * "Lunch"
+          Assets:Bank       -10.00 USD
+          Expenses:Food      10.00 USD
+
+        2022-01-20 * "Dinner"
+          Assets:Bank       -20.00 USD
+          Expenses:Food      20.00 USD
+
+        2022-02-01 * "Bus"
+          Assets:Bank       -5.00 USD
+          Expenses:Transport 5.00 USD
+    """
+
+    def test_basic_union(self):
+        """Given three SELECTs returning the same constant value from the postings table,
+        UNION should deduplicate the combined result, returning only unique values."""
+        curs = self.ctx.execute(
+            """SELECT 1 AS n
+               UNION
+               SELECT 1 AS n
+               UNION
+               SELECT 2 AS n"""
+        )
+        self.assertEqual(curs.fetchall(), [(1,), (2,)])
+
+    def test_union_all(self):
+        """Given two SELECTs returning the same constant value from the postings table,
+        UNION ALL should concatenate all rows from both SELECTs without deduplication."""
+        curs = self.ctx.execute(
+            """SELECT 1 AS n
+            UNION ALL
+            SELECT 1 AS n"""
+        )
+        self.assertEqual(curs.fetchall(), [(1,)] * 12)
+
+    def test_union_mixed(self):
+        """Given three SELECTs combined by UNION then UNION ALL,
+        the first UNION should deduplicate (yielding 1 row), then UNION ALL
+        should append all 6 rows from the third SELECT without deduplication,
+        resulting in 7 rows"""
+        curs = self.ctx.execute(
+            """SELECT 1 AS n
+            UNION
+            SELECT 1 AS n
+            UNION ALL
+            SELECT 1 AS n"""
+        )
+        self.assertEqual(curs.fetchall(), [(1,)] * 7)
+
+    def test_union_order_by(self):
+        """Given three SELECTs returning different constant values combined by UNION,
+        ORDER BY should sort the deduplicated combined result in ascending order."""
+        curs = self.ctx.execute(
+            """SELECT 2 AS n
+            UNION
+            SELECT 1 AS n
+            UNION
+            SELECT 3 AS n
+            ORDER BY 1"""
+        )
+        self.assertEqual(curs.fetchall(), [(1,), (2,), (3,)])
+
+    def test_union_limit(self):
+        """Given three SELECTs returning different constant values combined by UNION,
+        LIMIT should truncate the deduplicated combined result to the specified number of rows."""
+        curs = self.ctx.execute(
+            """SELECT 1 AS n
+            UNION
+            SELECT 2 AS n
+            UNION SELECT 3 AS n
+            LIMIT 2"""
+        )
+        self.assertEqual(curs.fetchall(), [(1,), (2,)])
+
+    def test_union_order_by_desc_limit(self):
+        """Given three SELECTs returning different constant values combined by UNION,
+        ORDER BY DESC should sort the deduplicated combined result in descending order,
+        and LIMIT should then truncate to the specified number of rows."""
+        curs = self.ctx.execute(
+            """SELECT 1 AS n
+            UNION
+            SELECT 2 AS n
+            UNION
+            SELECT 3 AS n
+            ORDER BY 1 DESC
+            LIMIT 2"""
+        )
+        self.assertEqual(curs.fetchall(), [(3,), (2,)])
+
+    def test_union_column_count_mismatch(self):
+        """Given two SELECTs with different column counts,
+        compilation should raise an error indicating column count mismatch."""
+        with self.assertRaises(CompilationError) as cm:
+            self.ctx.execute("SELECT 1, 2 UNION SELECT 1")
+        self.assertIn('same number of columns', str(cm.exception))
+
+    def test_union_type_mismatch(self):
+        """Given two SELECTs with incompatible column types,
+        compilation should raise an error indicating type mismatch."""
+        with self.assertRaises(CompilationError) as cm:
+            self.ctx.execute("SELECT 'a' UNION SELECT 2022-01-01")
+        self.assertIn('type mismatch', str(cm.exception))
+
+    def test_union_compatible_numeric_types(self):
+        """Given two SELECTs returning compatible numeric types (int and Decimal),
+        UNION should deduplicate the combined result, returning unique values."""
+        curs = self.ctx.execute("SELECT 1 UNION SELECT 1.5")
+        rows = curs.fetchall()
+        self.assertEqual(len(rows), 2)
+
+    def test_union_with_from(self):
+        """Given two SELECTs with explicit FROM clauses selecting different accounts,
+        UNION should combine the results, returning unique account names."""
+        curs = self.ctx.execute("""
+            SELECT account FROM OPEN ON 2022-01-01 WHERE account ~ 'Food'
+            UNION
+            SELECT account FROM OPEN ON 2022-01-01 WHERE account ~ 'Transport'
+        """)
+        rows = curs.fetchall()
+        self.assertEqual(len(rows), 2)
+        accounts = {row[0] for row in rows}
+        self.assertIn('Expenses:Food', accounts)
+        self.assertIn('Expenses:Transport', accounts)
+
+    def test_union_subquery(self):
+        """UNION with parenthesized subqueries."""
+        curs = self.ctx.execute("""
+            (SELECT 3 AS n ORDER BY 1 LIMIT 1)
+            UNION
+            (SELECT 1 AS n)
+        """)
+        rows = curs.fetchall()
+        self.assertEqual(set(rows), {(3,), (1,)})
+
+    def test_union_column_names_from_first(self):
+        """Column names come from first query."""
+        curs = self.ctx.execute("SELECT 1 AS first_name UNION SELECT 2 AS second_name")
+        self.assertEqual(curs.description[0].name, 'first_name')
+
+    def test_union_order_by_invisible_column_same_table(self):
+        """UNION ORDER BY on invisible column is allowed when all operands share the same table."""
+        curs = self.ctx.execute("""
+            SELECT account FROM OPEN ON 2022-01-01 WHERE account ~ 'Expenses'
+            UNION
+            SELECT account FROM OPEN ON 2022-01-01 WHERE account ~ 'Assets'
+            ORDER BY length(account)
+        """)
+        # Sorted by length: Assets:Bank (11), Expenses:Food (13), Expenses:Transport (18)
+        self.assertEqual(curs.fetchall(), [
+            ('Assets:Bank',),
+            ('Expenses:Food',),
+            ('Expenses:Transport',),
+        ])
+
+    def test_union_order_by_invisible_column_different_tables_rejected(self):
+        """UNION ORDER BY on invisible column is rejected when operands have different tables."""
+        with self.assertRaises(CompilationError) as cm:
+            # Use #accounts to reference the accounts table (not the accounts column)
+            self.ctx.execute("""
+                SELECT account FROM postings
+                UNION
+                SELECT account FROM #accounts
+                ORDER BY length(account)
+            """)
+        self.assertIn('SELECT list', str(cm.exception))
+
+    def test_union_pivot_by_raises(self):
+        """PIVOT BY on a UNION raises an explicit CompilationError instead of silently dropping it."""
+        with self.assertRaises(CompilationError) as cm:
+            self.ctx.execute("""
+                SELECT account, date GROUP BY account, date
+                UNION
+                SELECT account, date GROUP BY account, date
+                PIVOT BY account, date
+            """)
+        self.assertIn('PIVOT BY is not supported with UNION', str(cm.exception))

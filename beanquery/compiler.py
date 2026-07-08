@@ -3,6 +3,7 @@ import importlib
 import typing
 
 from decimal import Decimal
+from itertools import combinations
 from functools import singledispatchmethod
 from os import path
 from typing import Optional, Sequence, Mapping, Union
@@ -23,12 +24,15 @@ from .query_compile import (
     EvalColumn,
     EvalConstant,
     EvalCreateTable,
+    EvalGroupingSets,
+    EvalUnion,
     EvalGetItem,
     EvalGetter,
     EvalInsert,
     EvalOr,
     EvalPivot,
     EvalQuery,
+    EvalSelect,
     EvalConstantSubquery1D,
     EvalRow,
     EvalTarget,
@@ -98,7 +102,181 @@ class Compiler:
         raise NotImplementedError
 
     @_compile.register
+    def _query(self, node: ast.Query):
+        inner = self._build_inner(node)
+
+        # --- ORDER BY ---
+        # For a single SELECT, new invisible ORDER BY columns are appended
+        # directly. For a UNION, they are pushed to all operands only when
+        # every operand shares the same underlying table; otherwise we reject
+        # invisible ORDER BY to avoid ambiguity across different tables.
+        if isinstance(inner, EvalSelect):
+            new_targets, order_spec = self._compile_order_by(node.order_by, inner.c_targets)
+            inner.c_targets.extend(new_targets)
+        elif isinstance(inner, EvalUnion):
+            first_targets = inner.c_targets
+            new_targets, order_spec = self._compile_order_by(node.order_by, first_targets)
+        else:
+            raise AssertionError(f"Unexpected query child of type {type(inner)}")
+
+        if new_targets and isinstance(inner, EvalUnion):
+            all_tables = inner.tables
+            def table_key(t):
+                # Identify equivalent tables by type and underlying entries.
+                entries_id = id(getattr(t, 'entries', None))
+                return (type(t), entries_id)
+            all_same_table = len(all_tables) > 0 and len({table_key(t) for t in all_tables}) == 1
+            if all_same_table:
+                inner.extend_targets(new_targets)
+            else:
+                n_original = len(first_targets)
+                offending_text = None
+                for i, spec in enumerate(node.order_by):
+                    idx, _ = order_spec[i]
+                    if idx >= n_original and hasattr(spec.column, 'text'):
+                        offending_text = spec.column.text
+                        break
+                raise CompilationError(
+                    f'UNION queries only support ORDER BY on expressions that appear in the '
+                    f'SELECT list. Any column or expression in ORDER BY must be added as a '
+                    f'column to all SELECT clauses in the UNION. '
+                    f'Offending expression: {offending_text or "unknown"}')
+
+        # --- EvalSelect-only checks ---
+        if isinstance(inner, EvalSelect):
+            # DISTINCT with ORDER BY on columns not in SELECT produces non-deterministic
+            # results: when multiple rows have the same visible values but different
+            # ORDER BY values, which row survives DISTINCT is arbitrary.
+            # We allow ORDER BY f(x) if x is visible, since f(x) is computable from x.
+            if inner.distinct and new_targets:
+                visible_column_ids = set()
+                for t in inner.c_targets:
+                    if t.name is not None:
+                        visible_column_ids.update(id(c) for c in _collect_columns(t.c_expr))
+                for target in new_targets:
+                    for col in _collect_columns(target.c_expr):
+                        if id(col) not in visible_column_ids:
+                            raise CompilationError(
+                                f'When using DISTINCT, ORDER BY expressions must only '
+                                f'reference columns that appear in the SELECT list. '
+                                f'Offending ORDER BY expression: {node.order_by[0].column.text}')
+
+            # All non-aggregates must be covered by the GROUP-BY clause.
+            if inner.group_indexes is not None:
+                non_aggregate_indexes = {i for i, t in enumerate(inner.c_targets)
+                                         if not t.is_aggregate}
+                if non_aggregate_indexes != set(inner.group_indexes):
+                    missing_names = ['"{}"'.format(inner.c_targets[i].name)
+                                     for i in non_aggregate_indexes - set(inner.group_indexes)]
+                    raise CompilationError(
+                        'all non-aggregates must be covered by GROUP-BY clause in aggregate query: '
+                        'the following targets are missing: {}'.format(','.join(missing_names)))
+
+        # --- Wrap in EvalQuery ---
+        eval_query = EvalQuery(
+            select=inner,
+            order_spec=order_spec,
+            limit=node.limit,
+        )
+
+        # --- PIVOT BY ---
+        # EvalGroupingSets carries raw per-operand grouping_sets and supports
+        # PIVOT BY with per-set validation.  A bare EvalUnion from an explicit
+        # UNION query has no grouping metadata and is rejected.
+        if node.pivot_by is not None and isinstance(inner, EvalUnion) and not isinstance(inner, EvalGroupingSets):
+            raise CompilationError('PIVOT BY is not supported with UNION')
+        if isinstance(inner, EvalGroupingSets):
+            # Use inner.grouping_sets for compile-time check
+            pivots = self._compile_pivot_by(node.pivot_by, inner.c_targets, None, inner.grouping_sets)
+            if pivots:
+                return EvalPivot(eval_query, pivots)
+        elif isinstance(inner, EvalSelect):
+            # Use inner.grouping_indexes for compile-time check
+            pivots = self._compile_pivot_by(node.pivot_by, inner.c_targets, inner.group_indexes)
+            if pivots:
+                return EvalPivot(eval_query, pivots)
+
+        return eval_query
+
+    def _build_inner(self, node: ast.Query):
+        """Compile the inner node of a Query: EvalUnion for set-operator chains,
+        EvalSelect for a single SELECT.
+
+        Returns:
+          An EvalSelect (single SELECT) or EvalUnion (UNION chain).
+        """
+        set_operators = node.set_operators or []
+
+        if not set_operators:
+            return self._compile(node.queries[0])
+
+        # UNION chain: compile each SELECT against the original table.
+        # Each operand is wrapped in EvalQuery for a consistent interface
+        # between plain `SELECT ... UNION SELECT ...` and parenthesized
+        # subqueries `(SELECT ...) UNION (SELECT ...)`.
+        #
+        # Plain SELECTs get order_spec=[] and limit=None because the BQL
+        # grammar does not permit ORDER BY or LIMIT on bare UNION operands:
+        #
+        #   SELECT a FROM x UNION SELECT b FROM y ORDER BY 1
+        #   -- ORDER BY applies to the entire UNION result, not one operand
+        #
+        # To scope ORDER BY to a single operand, use a subquery:
+        #
+        #   (SELECT a FROM x ORDER BY a LIMIT 10) UNION SELECT b FROM y
+        saved_table = self.table
+        compiled = []
+        for select in node.queries:
+            self.table = saved_table
+            eq = self._compile(select)
+
+            # _compile returns EvalQuery for parenthesised subqueries
+            # (which already carry their own ORDER BY / LIMIT), but a bare
+            # SELECT compiles to EvalSelect and a GROUPING SETS SELECT
+            # compiles to EvalGroupingSets (an EvalUnion subclass).  Wrap
+            # both non-EvalQuery cases so every operand has the same shape.
+            if not isinstance(eq, EvalQuery):
+                eq = EvalQuery(select=eq, order_spec=[], limit=None)
+            compiled.append(eq)
+
+        # Validate UNION operands: same column count and compatible types.
+        # Type compatibility is resolved via the same common-coercion policy
+        # used for binary operators (object widening, int/Decimal auto-coercion,
+        # and set/Set[T] widening); see types.common_coercion_type,
+        # types.coercion_target_type, and types.common_set_type for details.
+        first_targets = compiled[0].c_targets
+        for i, eq in enumerate(compiled[1:], start=1):
+            if len(eq.c_targets) != len(first_targets):
+                raise CompilationError(
+                    f'UNION operands must have the same number of columns: '
+                    f'operand 0 has {len(first_targets)} columns, '
+                    f'operand {i} has {len(eq.c_targets)} columns')
+            for j, (t1, t2) in enumerate(zip(first_targets, eq.c_targets)):
+                if t1.c_expr.dtype != t2.c_expr.dtype:
+                    common_dtype, coerced, error = self._try_coerce_to_common_type(
+                        [t1.c_expr, t2.c_expr])
+                    if error is not None:
+                        raise CompilationError(
+                            f'UNION operands have type mismatch at position {j}: '
+                            f'{t1.c_expr.dtype.__name__} vs {t2.c_expr.dtype.__name__}')
+                    coerced1, coerced2 = coerced
+                    first_targets[j] = EvalTarget(coerced1, t1.name, t1.is_aggregate)
+                    eq.c_targets[j] = EvalTarget(coerced2, t2.name, t2.is_aggregate)
+
+        return EvalUnion(queries=compiled, set_operators=set_operators)
+
+    @_compile.register
     def _select(self, node: ast.Select):
+        """Compile a SELECT clause into Eval nodes.
+
+        Queries without or with simple GROUP BY compile to EvalSelect nodes.
+        Complex grouping (GROUP BY GROUPING SETS(...)) compiles to
+        EvalGroupingSets, as this produces a UNION of multiple queries with
+        different grouping settings.
+
+        Returns:
+            EvalSelect for single GROUP BY or EvalGroupingSets for GROUP BY GROUPING SETS.
+        """
         self.stack.append(self.table)
 
         # Compile the FROM clause.
@@ -120,51 +298,123 @@ class Compiler:
         if c_from_expr is not None:
             c_where = c_from_expr if c_where is None else EvalAnd([c_from_expr, c_where])
 
-        # Process the GROUP-BY clause.
-        new_targets, group_indexes, having_index = self._compile_group_by(node.group_by, c_targets)
+        # Process the GROUP-BY clause.  _compile_group_by returns grouping_sets
+        # in set-list form ([[idx, ...], ...]) or None for non-aggregate queries.
+        new_targets, grouping_sets, having_index = self._compile_group_by(node.group_by, c_targets)
         c_targets.extend(new_targets)
 
-        # Process the ORDER-BY clause.
-        new_targets, order_spec = self._compile_order_by(node.order_by, c_targets)
-        c_targets.extend(new_targets)
+        # Single-set / plain GROUP BY: flatten to a flat group_indexes and
+        # return a plain EvalSelect, identical to the pre-GROUPING-SETS path.
+        if grouping_sets is None or len(grouping_sets) == 1:
+            group_indexes = grouping_sets[0] if grouping_sets is not None else None
 
-        # If this is an aggregate query (it groups, see list of indexes), check that
-        # the set of non-aggregates match exactly the group indexes. This should
-        # always be the case at this point, because we have added all the necessary
-        # targets to the list of group-by expressions and should have resolved all
-        # the indexes.
-        if group_indexes is not None:
-            non_aggregate_indexes = {index for index, c_target in enumerate(c_targets)
-                                     if not c_target.is_aggregate}
-            if non_aggregate_indexes != set(group_indexes):
-                missing_names = ['"{}"'.format(c_targets[index].name)
-                                 for index in non_aggregate_indexes - set(group_indexes)]
-                raise CompilationError(
-                    'all non-aggregates must be covered by GROUP-BY clause in aggregate query: '
-                    'the following targets are missing: {}'.format(','.join(missing_names)))
+            # ORDER BY and LIMIT are compiled by the enclosing _query handler,
+            # which also validates aggregate coverage after ORDER BY targets are added.
+            select = EvalSelect(
+                table=self.table,
+                c_targets=c_targets,
+                c_where=c_where,
+                group_indexes=group_indexes,
+                having_index=having_index,
+                distinct=node.distinct,
+            )
 
-        query = EvalQuery(self.table,
-                          c_targets,
-                          c_where,
-                          group_indexes,
-                          having_index,
-                          order_spec,
-                          node.limit,
-                          node.distinct)
+            self.stack.pop()
+            return select
 
-        pivots = self._compile_pivot_by(node.pivot_by, c_targets, group_indexes)
-        if pivots:
-            return EvalPivot(query, pivots)
-
+        # Multiple grouping sets: desugar into EvalGroupingSets (EvalUnion subclass).
         self.stack.pop()
-        return query
+        return self._desugar_grouping_sets(
+            grouping_sets, c_targets, c_where, having_index, node.distinct
+        )
+
+    def _desugar_grouping_sets(
+        self, grouping_sets, c_targets, c_where, having_index, distinct
+    ):
+        """Lower multiple grouping sets into an EvalGroupingSets node.
+
+        Each set produces one EvalSelect operand.  Non-grouped visible targets
+        are replaced with EvalConstant(None, dtype) so all operands share an
+        identical column structure.  The operands are joined by UNION ALL.
+
+        Args:
+          grouping_sets: List of index-lists, one per set (len >= 2).
+          c_targets: Compiled target list shared by all operands.
+          c_where: Compiled WHERE/FROM expression, or None.
+          having_index: Index of the invisible HAVING target, or None.
+          distinct: Whether DISTINCT was requested on the SELECT.
+
+        Returns:
+          An EvalGroupingSets carrying the raw per-operand grouping sets so that
+          PIVOT BY can validate its axis columns with per-set precision.
+        """
+        # Duplicate sets would produce identical rows via UNION ALL.
+        seen_sets = set()
+        for one_set in grouping_sets:
+            key = tuple(sorted(one_set))
+            if key in seen_sets:
+                raise CompilationError(
+                    f'duplicate grouping set {list(one_set)!r}: '
+                    'identical sets produce duplicate rows')
+            seen_sets.add(key)
+
+        # Every visible non-aggregate target must appear in at least one set.
+        visible_nonaggregate_indexes = {
+            i for i, t in enumerate(c_targets)
+            if t.name is not None and not t.is_aggregate
+        }
+        covered = {idx for one_set in grouping_sets for idx in one_set}
+        missing = visible_nonaggregate_indexes - covered
+        if missing:
+            missing_names = [f'"{c_targets[i].name}"' for i in sorted(missing)]
+            raise CompilationError(
+                'the following SELECT columns are not covered by any grouping set: '
+                + ', '.join(missing_names))
+
+        # Build one EvalSelect per grouping set.  Targets absent from the set
+        # are replaced with EvalConstant(None, dtype) so the column structure
+        # is identical across all operands.
+        operands = []
+        for one_set in grouping_sets:
+            set_indexes = set(one_set)
+            operand_targets = []
+            for i, t in enumerate(c_targets):
+                if not t.is_aggregate and i not in set_indexes:
+                    # Replace with NULL of the same dtype so column types match.
+                    null_expr = EvalConstant(None, t.c_expr.dtype)
+                    operand_targets.append(EvalTarget(null_expr, t.name, t.is_aggregate))
+                else:
+                    operand_targets.append(t)
+
+            # group_indexes for this operand: all non-aggregate indexes
+            # (both real and NULL-substituted ones keep the column grouped).
+            operand_group_indexes = [
+                i for i, t in enumerate(operand_targets)
+                if not t.is_aggregate
+            ]
+
+            operand_select = EvalSelect(
+                table=self.table,
+                c_targets=operand_targets,
+                c_where=c_where,
+                group_indexes=operand_group_indexes,
+                having_index=having_index,
+                distinct=distinct,
+            )
+            operands.append(EvalQuery(select=operand_select, order_spec=[], limit=None))
+
+        return EvalGroupingSets(
+            queries=operands,
+            set_operators=['union_all'] * (len(operands) - 1),
+            grouping_sets=grouping_sets,
+        )
 
     def _compile_from(self, node):
         if node is None:
             return None
 
         # Subquery.
-        if isinstance(node, ast.Select):
+        if isinstance(node, ast.Query):
             self.table = SubqueryTable(self._compile(node))
             return None
 
@@ -312,13 +562,16 @@ class Compiler:
 
         return new_targets[len(c_targets):], order_spec
 
-    def _compile_pivot_by(self, pivot_by, targets, group_indexes):
+    def _compile_pivot_by(self, pivot_by, targets, group_indexes, grouping_sets=None):
         """Compiles a PIVOT BY clause.
 
         Resolve and validate columns references in the PIVOT BY clause.
-        The PIVOT BY clause accepts two name od index references to
-        columns in the SELECT targets list. The second columns should be a
-        GROUP BY column so that the values of the pivot column are unique.
+        The PIVOT BY clause accepts two name or index references to columns in
+        the SELECT targets list.  When grouping_sets is provided (GROUPING SETS/
+        ROLLUP/CUBE), validates that the pivot column never appears in a
+        grouping set without the row column — which would let two rows share the
+        same pivot key without a unique row identity.  For plain GROUP BY, falls
+        back to checking membership in group_indexes.
 
         """
         if pivot_by is None:
@@ -351,7 +604,14 @@ class Compiler:
         # Sanity checks.
         if indexes[0] == indexes[1]:
             raise CompilationError('the two PIVOT BY columns cannot be the same column')
-        if indexes[1] not in group_indexes:
+        if grouping_sets is not None:
+            # The pivot column must appear in at least one grouping set so that
+            # it takes on real (non-NULL) values to pivot on.  Grand-total sets
+            # FIXME: This is not optimal as many cases that produce ambiguous
+            # pivoting key values are not caught by this check.
+            if not any(indexes[1] in one_set for one_set in grouping_sets):
+                raise CompilationError('the second PIVOT BY column must be a GROUP BY column')
+        elif indexes[1] not in group_indexes:
             raise CompilationError('the second PIVOT BY column must be a GROUP BY column')
 
         return indexes
@@ -364,83 +624,107 @@ class Compiler:
           c_targets: A list of compiled target expressions.
         Returns:
           A tuple of
-           new_targets: A list of new compiled target nodes.
-           group_indexes: If the query is an aggregate query, a list of integer
-             indexes to be used for processing grouping. Note that this list may be
-             empty (in the case of targets with only aggregates). On the other hand,
-             if this is not an aggregated query, this is set to None. So do
-             distinguish the empty list vs. None.
+           new_targets: A list of new target nodes added beyond c_targets.
+           grouping_sets: For aggregate queries, a list of index-sets in set-list
+             form: each inner list is one grouping set (the group_indexes for one
+             SELECT operand).  A plain GROUP BY or a single-set GROUPING SETS
+             yields exactly one inner list.  An aggregate query that groups by
+             nothing is [[]] (one empty set).  For non-aggregate queries this is
+             None.  The None vs. non-None distinction is significant and consumed
+             by _select / query_execute.py.
+           having_index: Index of the HAVING target in the extended target list,
+             or None when there is no HAVING clause.
         """
         new_targets = c_targets[:]
         c_target_expressions = [c_target.c_expr for c_target in c_targets]
 
-        group_indexes = []
         having_index = None
 
         if group_by:
-            assert group_by.columns, "Internal error with GROUP-BY parsing"
+            assert group_by.elements, "Internal error with GROUP-BY parsing"
 
-            # Compile group-by expressions and resolve them to their targets if
-            # possible. A GROUP-BY column may be one of the following:
-            #
-            # * A reference to a target by name.
-            # * A reference to a target by index (starting at one).
-            # * A new, non-aggregate expression.
-            #
-            # References by name are converted to indexes. New expressions are
-            # inserted into the list of targets as invisible targets.
+            # Determine whether any element is a complex grouping construct
+            # (GROUPING SETS, ROLLUP, or CUBE).  Plain GROUP BY keeps the hidden-target fallback;
+            # complex GROUP BY forbids it so every union operand shares an
+            # identical column structure.
+            complex_elements = (ast.GroupingSets, ast.Rollup, ast.Cube)
+            is_complex = any(isinstance(e, complex_elements) for e in group_by.elements)
+
             targets_name_map = {target.name: index for index, target in enumerate(c_targets)}
-            for column in group_by.columns:
-                index = None
 
-                # Process target references by index.
-                if isinstance(column, int):
-                    index = column - 1
-                    if not 0 <= index < len(c_targets):
-                        raise CompilationError(f'invalid GROUP-BY column index {column}')
+            # Each element expands to a list of index-sets:
+            #   plain GroupColumn  -> [[idx]]
+            #   GroupingSets       -> [[...], [...], ...] (one per set)
+            #   Rollup             -> [[i1, i2], [i1], []] (hierarchical)
+            #   Cube               -> [[i1, i2], [i1], [i2], []] (power set, 2^N combinations)
+            element_set_lists = []
+            for element in group_by.elements:
+                if isinstance(element, ast.GroupColumn):
+                    idx = self._compile_group_by_simple_element(
+                        element.column, c_targets, new_targets,
+                        c_target_expressions, targets_name_map,
+                        strict=is_complex,
+                    )
+                    element_set_lists.append([[idx]])
+
+                elif isinstance(element, ast.GroupingSets):
+                    sets_for_element = []
+                    for one_set in element.sets:
+                        resolved_set = [
+                            self._compile_group_by_simple_element(
+                                col, c_targets, new_targets,
+                                c_target_expressions, targets_name_map,
+                                strict=True,
+                            )
+                            for col in one_set
+                        ]
+                        sets_for_element.append(resolved_set)
+                    element_set_lists.append(sets_for_element)
+
+                elif isinstance(element, ast.Rollup):
+                    # ROLLUP(a, b, c) desugars to GROUPING SETS((a, b, c), (a, b), (a), ())
+                    # Resolve all columns to indices first
+                    resolved_columns = [
+                        self._compile_group_by_simple_element(
+                            col, c_targets, new_targets,
+                            c_target_expressions, targets_name_map,
+                            strict=True,
+                        )
+                        for col in element.columns
+                    ]
+                    # Generate hierarchical sets from most specific to least specific
+                    sets_for_element = []
+                    for i in range(len(resolved_columns), -1, -1):
+                        sets_for_element.append(resolved_columns[:i] if i > 0 else [])
+                    element_set_lists.append(sets_for_element)
+
+                elif isinstance(element, ast.Cube):
+                    # CUBE(a, b, c) desugars to GROUPING SETS with all 2^N combinations
+                    # Resolve all columns to indices first
+                    resolved_columns = [
+                        self._compile_group_by_simple_element(
+                            col, c_targets, new_targets,
+                            c_target_expressions, targets_name_map,
+                            strict=True,
+                        )
+                        for col in element.columns
+                    ]
+                    # Generate power set (all 2^N combinations)
+                    sets_for_element = []
+                    for i in range(len(resolved_columns), -1, -1):
+                        for combo in combinations(resolved_columns, i):
+                            sets_for_element.append(list(combo))
+                    element_set_lists.append(sets_for_element)
 
                 else:
-                    # Process target references by name. These will be parsed as
-                    # simple Column expressions. If they refer to a target name, we
-                    # resolve them.
-                    if isinstance(column, ast.Column):
-                        name = column.name
-                        index = targets_name_map.get(name, None)
+                    raise CompilationError(
+                        f'unexpected grouping element type {type(element).__name__}'
+                    )
 
-                    # Otherwise we compile the expression and add it to the list of
-                    # targets to evaluate and index into that new target.
-                    if index is None:
-                        c_expr = self._compile(column)
+            # Combine all per-element set-lists via cartesian product.
+            grouping_sets = _combine_grouping_sets(element_set_lists)
 
-                        # Check if the new expression is an aggregate.
-                        aggregate = is_aggregate(c_expr)
-                        if aggregate:
-                            raise CompilationError(f'GROUP-BY expressions may not be aggregates: "{column}"')
-
-                        # Attempt to reconcile the expression with one of the existing
-                        # target expressions.
-                        try:
-                            index = c_target_expressions.index(c_expr)
-                        except ValueError:
-                            # Add the new target. 'None' for the target name implies it
-                            # should be invisible, not to be rendered.
-                            index = len(new_targets)
-                            new_targets.append(EvalTarget(c_expr, None, aggregate))
-                            c_target_expressions.append(c_expr)
-
-                assert index is not None, "Internal error, could not index group-by reference."
-                group_indexes.append(index)
-
-                # Check that the group-by column references a non-aggregate.
-                c_expr = new_targets[index].c_expr
-                if is_aggregate(c_expr):
-                    raise CompilationError(f'GROUP-BY expressions may not reference aggregates: "{column}"')
-
-                # Check that the group-by column has a supported hashable type.
-                if not issubclass(c_expr.dtype, collections.abc.Hashable):
-                    raise CompilationError(f'GROUP-BY a non-hashable type is not supported: "{column}"')
-
-            # Compile HAVING clause.
+            # Compile HAVING clause (identical across all union operands).
             if group_by.having is not None:
                 c_expr = self._compile(group_by.having)
                 if not is_aggregate(c_expr):
@@ -456,25 +740,106 @@ class Compiler:
                 # If the query is an aggregate query, check that all the targets are
                 # aggregates.
                 if all(aggregate_bools):
-                    # FIXME: shold we really be checking for the empty
-                    # list or is checking for a false value enough?
-                    assert group_indexes == []
+                    grouping_sets = [[]]
                 elif SUPPORT_IMPLICIT_GROUPBY:
                     # If some of the targets aren't aggregates, automatically infer
                     # that they are to be implicit group by targets. This makes for
                     # a much more convenient syntax for our lightweight SQL, where
                     # grouping is optional.
-                    group_indexes = [
+                    grouping_sets = [[
                         index for index, c_target in enumerate(c_targets)
-                        if not c_target.is_aggregate]
+                        if not c_target.is_aggregate]]
                 else:
                     raise CompilationError('aggregate query without a GROUP-BY should have only aggregates')
             else:
-                # This is not an aggregate query; don't set group_indexes to
+                # This is not an aggregate query; don't set grouping_sets to
                 # anything useful, we won't need it.
-                group_indexes = None
+                grouping_sets = None
 
-        return new_targets[len(c_targets):], group_indexes, having_index
+        return new_targets[len(c_targets):], grouping_sets, having_index
+
+    def _compile_group_by_simple_element(
+        self, column, c_targets, new_targets, c_target_expressions,
+        targets_name_map, strict=False
+    ):
+        """Compile a single GROUP-BY element (non-GROUPING SETS).
+
+        Resolves a GROUP-BY column reference to a target index. The column may be:
+        - An integer index (1-based) referencing a target position
+        - A Column name referencing an existing target
+        - A new expression to be compiled and added as an invisible target
+          (only allowed when strict=False)
+
+        Args:
+          column: The column reference (int, ast.Column, or other expression node)
+          c_targets: Original list of compiled targets (for length checks)
+          new_targets: Mutable list of compiled targets (may be extended with new expressions)
+          c_target_expressions: Mutable list of compiled expressions (parallel to new_targets)
+          targets_name_map: Dict mapping target names to their indexes in c_targets
+          strict: When True, a column that does not resolve to an existing visible
+            target raises CompilationError instead of creating an invisible target.
+            Required for GROUPING SETS so every operand shares the same column structure.
+
+        Returns:
+          index: Integer index into new_targets for this GROUP-BY column
+        """
+        index = None
+
+        # Process target references by index.
+        if isinstance(column, int):
+            index = column - 1
+            if not 0 <= index < len(c_targets):
+                raise CompilationError(f'invalid GROUP-BY column index {column}')
+
+        else:
+            # Process target references by name. These will be parsed as
+            # simple Column expressions. If they refer to a target name, we
+            # resolve them.
+            if isinstance(column, ast.Column):
+                name = column.name
+                index = targets_name_map.get(name, None)
+
+            # Otherwise we compile the expression and add it to the list of
+            # targets to evaluate and index into that new target.
+            if index is None:
+                c_expr = self._compile(column)
+
+                # Check if the new expression is an aggregate.
+                aggregate = is_aggregate(c_expr)
+                if aggregate:
+                    raise CompilationError(f'GROUP-BY expressions may not be aggregates: "{column}"')
+
+                # Attempt to reconcile the expression with one of the existing
+                # target expressions.
+                try:
+                    index = c_target_expressions.index(c_expr)
+                except ValueError as e:
+                    # In strict mode (GROUPING SETS) every GROUP BY column must
+                    # resolve to a visible target so all union operands share the
+                    # same column structure.
+                    if strict:
+                        raise CompilationError(
+                            f'GROUP-BY column "{column}" is not in the SELECT list; '
+                            'hidden targets are not allowed inside GROUPING SETS'
+                        ) from e
+                    # Add the new target. 'None' for the target name implies it
+                    # should be invisible, not to be rendered.
+                    index = len(new_targets)
+                    new_targets.append(EvalTarget(c_expr, None, aggregate))
+                    c_target_expressions.append(c_expr)
+
+        assert index is not None, "Internal error, could not index group-by reference."
+
+        # Check that the group-by column references a non-aggregate.
+        c_expr = new_targets[index].c_expr
+        if is_aggregate(c_expr):
+            raise CompilationError(f'GROUP-BY expressions may not reference aggregates: "{column}"')
+
+        # Check that the group-by column has a supported hashable type.
+        if not issubclass(c_expr.dtype, collections.abc.Hashable):
+            raise CompilationError(f'GROUP-BY a non-hashable type is not supported: "{column}"')
+
+        return index
 
     @_compile.register
     def _column(self, node: ast.Column):
@@ -849,7 +1214,11 @@ class Compiler:
         self.table = self.context.tables.get('entries')
         expr = self._compile_from(node.from_clause)
         targets = [EvalTarget(EvalRow(), 'ROW(*)', False)]
-        return EvalQuery(self.table, targets, expr, None, None, None, None, False)
+        return EvalQuery(
+            select=EvalSelect(self.table, targets, expr, None, None, False),
+            order_spec=None,
+            limit=None,
+        )
 
     @_compile.register
     def _create_table(self, node: ast.CreateTable):
@@ -895,6 +1264,38 @@ class Compiler:
         return EvalInsert(table, values)
 
 
+def _combine_grouping_sets(element_set_lists):
+    """Compute the cartesian product of per-element grouping-set lists.
+
+    Each GROUP BY element expands to a list of index-sets:
+    - A plain GroupColumn expands to [[idx]] (one set containing one index).
+    - A GroupingSets element expands to its list of index lists.
+
+    The final grouping sets are the cartesian product: each combination picks
+    one index-set from each element and concatenates the member lists.
+
+    Args:
+      element_set_lists: A list of lists of lists of int.  One outer entry per
+        GROUP BY element, each entry being the list of index-sets for that element.
+
+    Returns:
+      A list of lists of int, each inner list being the group_indexes for one
+      union operand.  An aggregate query that groups by nothing is represented
+      as [[]] (one set, empty), *not* None (which means non-aggregate).
+
+    >>> _combine_grouping_sets([[[0]], [[1, 2]]])
+    [[0, 1, 2]]
+    >>> _combine_grouping_sets([[[0]], [[1], []]])
+    [[0, 1], [0]]
+    >>> _combine_grouping_sets([[[]]])
+    [[]]
+    """
+    result = [[]]  # identity for cartesian product
+    for element_sets in element_set_lists:
+        result = [existing + one_set for existing in result for one_set in element_sets]
+    return result
+
+
 def transform_journal(journal):
     """Translate a Journal entry into an uncompiled Select statement.
 
@@ -903,7 +1304,7 @@ def transform_journal(journal):
     Returns:
       An instance of an uncompiled Select object.
     """
-    cooked_select = parser.parse("""
+    cooked = parser.parse("""
 
         SELECT
            date,
@@ -918,12 +1319,15 @@ def transform_journal(journal):
     """.format(where=('WHERE account ~ "{}"'.format(journal.account)
                       if journal.account
                       else ''),
-               summary_func=journal.summary_func or ''))
+               summary_func=journal.summary_func or '')).queries[0]
 
-    return ast.Select(cooked_select.targets,
-                      journal.from_clause,
-                      cooked_select.where_clause,
-                      None, None, None, None, None)
+    select = ast.Select(
+        cooked.targets,
+        journal.from_clause,
+        cooked.where_clause,
+        None, None)
+
+    return ast.Query(queries=[select], set_operators=[], order_by=None, limit=None, pivot_by=None)
 
 
 def transform_balances(balances):
@@ -940,20 +1344,22 @@ def transform_balances(balances):
     ## the first or last sort-order value gets used, because it would simplify
     ## the input statement.
 
-    cooked_select = parser.parse("""
+    cooked_query = parser.parse("""
 
       SELECT account, SUM({}(position))
       GROUP BY account, ACCOUNT_SORTKEY(account)
       ORDER BY ACCOUNT_SORTKEY(account)
 
     """.format(balances.summary_func or ""))
+    cooked = cooked_query.queries[0]
 
-    return ast.Select(cooked_select.targets,
-                      balances.from_clause,
-                      balances.where_clause,
-                      cooked_select.group_by,
-                      cooked_select.order_by,
-                      None, None, None)
+    select = ast.Select(
+        cooked.targets,
+        balances.from_clause,
+        balances.where_clause,
+        cooked.group_by,
+        None)
+    return ast.Query(queries=[select], set_operators=[], order_by=cooked_query.order_by, limit=None, pivot_by=None)
 
 
 def get_target_name(target):
@@ -1021,6 +1427,14 @@ def is_aggregate(node):
     # much. Performance of the query compilation matters very little overall.
     _, aggregates = get_columns_and_aggregates(node)
     return bool(aggregates)
+
+
+def _collect_columns(node):
+    """Recursively collect all EvalColumn nodes from an expression tree."""
+    if isinstance(node, EvalColumn):
+        yield node
+    for child in node.childnodes():
+        yield from _collect_columns(child)
 
 
 def compile(context, statement, parameters=None):

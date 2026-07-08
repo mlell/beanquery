@@ -27,6 +27,7 @@ from beanquery.parser import ast
 from beanquery import query_execute
 from beanquery import types
 from beanquery import tables
+from beanquery.errors import DataError
 
 
 MARKER = object()
@@ -686,7 +687,147 @@ class EvalConstantSubquery1D(EvalNode):
 EvalTarget = collections.namedtuple('EvalTarget', 'c_expr name is_aggregate')
 
 
-# A compiled query, ready for execution.
+@dataclasses.dataclass
+class EvalUnion:
+    """Execute a chain of SELECTs combined by set operators (UNION, UNION ALL).
+
+    This class has the same interface as EvalSelect: __call__ returns
+    (result_types, rows, visible_mask). It is wrapped by EvalQuery which
+    handles ORDER BY, LIMIT, and visible column extraction.
+
+    set_operators[i] is the set operator between queries[i] and queries[i+1].
+    Supported values: 'union' (deduplicate), 'union_all' (keep all rows).
+    """
+
+    queries: list
+    set_operators: list[str]
+
+    @property
+    def c_targets(self):
+        """Return targets from the first query (read-only view)."""
+        return self.queries[0].c_targets
+
+    @property
+    def columns(self):
+        return [t for t in self.c_targets if t.name is not None]
+
+    @property
+    def tables(self):
+        """Return list of tables from all operands."""
+        result = []
+        for q in self.queries:
+            result.extend(q.tables)
+        return result
+
+    def extend_targets(self, new_targets):
+        """Add invisible targets to all operands."""
+        for q in self.queries:
+            q.extend_targets(new_targets)
+
+    def __call__(self):
+        # Temporarily assign names to invisible targets so inner queries preserve them.
+        # Find a unique prefix by checking existing column names.
+        existing_names = {t.name for t in self.c_targets if t.name is not None}
+        col_num = 0
+        while f'col{col_num}' in existing_names:
+            col_num += 1
+
+        # Track which targets were originally invisible and give them temporary names.
+        invisible_indexes = []
+        for i, t in enumerate(self.c_targets):
+            if t.name is None:
+                invisible_indexes.append(i)
+                temp_name = f'col{col_num}'
+                col_num += 1
+                for q in self.queries:
+                    q.c_targets[i] = EvalTarget(q.c_targets[i].c_expr, temp_name, q.c_targets[i].is_aggregate)
+
+        # Accumulate rows, applying deduplication at each UNION boundary.
+        _, rows = self.queries[0]()
+        for op, query in zip(self.set_operators, self.queries[1:]):
+            _, next_rows = query()
+            if op == 'union_all':
+                rows = rows + next_rows
+            else:
+                # UNION: deduplicate the entire accumulated result, preserving
+                # first-seen order across all rows accumulated so far.
+                seen = set()
+                deduped = []
+                for r in rows + next_rows:
+                    if r not in seen:
+                        seen.add(r)
+                        deduped.append(r)
+                rows = deduped
+
+        # Restore invisible targets by removing temporary names.
+        for i in invisible_indexes:
+            for q in self.queries:
+                qt = q.c_targets[i]
+                q.c_targets[i] = EvalTarget(qt.c_expr, None, qt.is_aggregate)
+
+        # Return same interface as EvalSelect: (result_types, rows, visible_mask).
+        result_types = tuple(cursor.Column(t.name, t.c_expr.dtype) for t in self.c_targets)
+        visible_mask = [t.name is not None for t in self.c_targets]
+        return result_types, rows, visible_mask
+
+
+@dataclasses.dataclass
+class EvalGroupingSets(EvalUnion):
+    """An EvalUnion produced by desugaring GROUP BY GROUPING SETS.
+
+    Carries the raw per-operand grouping sets so that PIVOT BY can validate
+    its axis columns against the exact set membership of each operand.
+
+    Execution logic is inherited from EvalUnion.
+    """
+
+    grouping_sets: list[list[int]]
+
+
+# A compiled query wrapping a SELECT or a UNION of multiple SELECTs.
+#
+# This mirrors ast.Query which wraps ast.Select and owns ORDER BY, LIMIT.
+#
+# Attributes:
+#   select: The inner EvalSelect or EvalUnion.
+#   order_spec: A list of (integer indexes, sort order) tuples.
+#   limit: An optional integer used to cut off the number of result rows returned.
+@dataclasses.dataclass
+class EvalQuery:
+    select: EvalSelect | EvalUnion
+    order_spec: list[tuple[int, ast.Ordering]]
+    limit: int
+
+    @property
+    def columns(self):
+        return self.select.columns
+
+    @property
+    def c_targets(self):
+        return self.select.c_targets
+
+    @property
+    def tables(self):
+        """Return list of tables from the inner select/union."""
+        assert isinstance(self.select, (EvalUnion, EvalSelect)), \
+            "Compiler must give us either an EvalUnion or an EvalSelect child"
+        if isinstance(self.select, EvalUnion):
+            return self.select.tables
+        elif isinstance(self.select, EvalSelect):
+            return [self.select.table]
+
+    def extend_targets(self, new_targets):
+        """Add invisible targets to the inner select/union."""
+        if isinstance(self.select, EvalUnion):
+            self.select.extend_targets(new_targets)
+        elif isinstance(self.select, EvalSelect):
+            self.select.c_targets.extend(new_targets)
+
+    def __call__(self):
+        return query_execute.execute_query(self)
+
+
+# A compiled SELECT, ready for execution.
 #
 # Attributes:
 #   c_targets: A list of compiled targets (instancef of EvalTarget).
@@ -696,19 +837,14 @@ EvalTarget = collections.namedtuple('EvalTarget', 'c_expr name is_aggregate')
 #     this list of indexes should always cover all non-aggregates in 'c_targets'.
 #     And this list may well include some invisible columns if only specified in
 #     the GROUP BY clause.
-#   order_spec: A list of (integer indexes, sort order) tuples.
-#     This list may refer to either aggregates or non-aggregates.
-#   limit: An optional integer used to cut off the number of result rows returned.
 #   distinct: An optional boolean that requests we should uniquify the result rows.
 @dataclasses.dataclass
-class EvalQuery:
+class EvalSelect:
     table: tables.Table
     c_targets: list
     c_where: EvalNode
     group_indexes: list[int]
     having_index: int
-    order_spec: list[tuple[int, ast.Ordering]]
-    limit: int
     distinct: bool
 
     @property
@@ -733,24 +869,35 @@ class EvalPivot:
         othercols = [i for i in range(len(columns)) if i not in self.pivots]
         nother = len(othercols)
         other = lambda x: tuple(x[i] for i in othercols)
-        keys = sorted({row[col2] for row in rows})
+        # ROLLUP/CUBE grand-total rows produce NULL for the pivot column; sort them last.
+        keys = sorted({row[col2] for row in rows}, key=lambda k: (k is None, k))
 
         # Compute the new column names and dtypes.
         if nother > 1:
             it = itertools.product(keys, other(columns))
-            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}/{col.name}' for key, col in it]
+            names = (
+                [f'{columns[col1].name}/{columns[col2].name}'] 
+                + [f"{('NULL' if key is None else key)}/{col.name}" for key, col in it]
+            )
         else:
-            names = [f'{columns[col1].name}/{columns[col2].name}'] + [f'{key}' for key in keys]
+            names = [f'{columns[col1].name}/{columns[col2].name}'] + ['NULL' if key is None else f'{key}' for key in keys]
         datatypes = [columns[col1].datatype] + [col.datatype for col in other(columns)] * len(keys)
         columns = tuple(cursor.Column(name, datatype) for name, datatype in zip(names, datatypes))
 
         # Populate the pivoted table.
         pivoted = []
-        rows.sort(key=operator.itemgetter(col1))
+        rows.sort(key=lambda row: (row[col1] is not None, row[col1]))
         for field1, group in itertools.groupby(rows, key=operator.itemgetter(col1)):
             outrow = [field1] + [None] * (len(columns) - 1)
+            written_indices = set()
             for row in group:
                 index = keys.index(row[col2]) * nother + 1
+                if index in written_indices:
+                    raise DataError(
+                        f'PIVOT BY duplicate key: column {columns[col2].name} '
+                        f'has duplicate value {row[col2]!r} for {columns[col1].name}={field1!r}'
+                    )
+                written_indices.add(index)
                 outrow[index:index+nother] = other(row)
             pivoted.append(tuple(outrow))
 
