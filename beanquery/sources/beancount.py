@@ -365,12 +365,12 @@ class EntriesTable(_BeancountTable):
             return None
         return ' | '.join(filter(None, [entry.payee, entry.narration]))
 
-    @columns.register(set)
+    @columns.register(typing.Set[str])
     def tags(entry):
         """The set of tags (#abc) of the transaction."""
         return getattr(entry, 'tags', None)
 
-    @columns.register(set)
+    @columns.register(typing.Set[str])
     def links(entry):
         """The set of links (^abc) of the transaction."""
         return getattr(entry, 'links', None)
@@ -503,12 +503,12 @@ class PostingsTable(_BeancountTable):
         """A combination of the payee + narration for the transaction of this posting."""
         return ' | '.join(filter(None, [context.entry.payee, context.entry.narration]))
 
-    @columns.register(set)
+    @columns.register(typing.Set[str])
     def tags(context):
         """The set of tags of the parent transaction for this posting."""
         return context.entry.tags
 
-    @columns.register(set)
+    @columns.register(typing.Set[str])
     def links(context):
         """The set of links of the parent transaction for this posting."""
         return context.entry.links
