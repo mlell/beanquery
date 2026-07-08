@@ -907,6 +907,42 @@ def date_bin_str(stride, source, origin):
     return date_bin(interval(stride), source, origin)
 
 
+@function([datetime.date, datetime.date, datetime.date], object)
+@function([datetime.date, str, datetime.date], object)
+@function([datetime.date, datetime.date, str], object)
+@function([datetime.date, str, str], object)
+def date_cap(date_value, min_date, max_date):
+    """Cap a date to a specified range, replacing out-of-range values with sentinels.
+
+    Dates before min_date are replaced with min_date.
+    Dates after max_date are replaced with max_date.
+    Dates within the range are returned unchanged.
+
+    This is useful for grouping dates outside a range in queries.
+
+    Arguments:
+      date_value: The date to cap
+      min_date, max_date: Minimum and maximum date thresholds. Strings are
+        parsed as dates (YYYY-MM-DD). The empty string disables the threshold
+
+    Examples:
+      date_cap(date, date_trunc('month', today()), today())
+      date_cap(date, '', '2020-12-31')
+      date_cap(date, '2020-01-01', '')
+    """
+
+    if isinstance(min_date, str) and min_date != "":
+        min_date = parse_date(min_date, frmt = '%Y-%m-%d')
+    if isinstance(max_date, str) and max_date != "":
+        max_date = parse_date(max_date, frmt = '%Y-%m-%d')
+    if min_date != "" and date_value < min_date:
+        return min_date
+    elif max_date != "" and date_value > max_date:
+        return max_date
+    else:
+        return date_value
+
+
 def aggregator(intypes, outtype = None, name=None, groups = None):
     """Decorator to register an aggregator function.
 
