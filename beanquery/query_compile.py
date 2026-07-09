@@ -876,7 +876,7 @@ class EvalPivot:
         if nother > 1:
             it = itertools.product(keys, other(columns))
             names = (
-                [f'{columns[col1].name}/{columns[col2].name}'] 
+                [f'{columns[col1].name}/{columns[col2].name}']
                 + [f"{('NULL' if key is None else key)}/{col.name}" for key, col in it]
             )
         else:

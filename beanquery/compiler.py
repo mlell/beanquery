@@ -2,7 +2,6 @@ import collections.abc
 import importlib
 import typing
 
-from decimal import Decimal
 from itertools import combinations
 from functools import singledispatchmethod
 from os import path
