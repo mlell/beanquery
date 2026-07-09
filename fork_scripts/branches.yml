@@ -29,3 +29,8 @@ branches:
   merged: true
   base-commit: 62b6abba7
   base-date: 2026-06-11 22:28:39 +0200
+- name: dev-fix-interval
+  description: Fix the regex in the BQL function interval()
+  merged: true
+  base-commit: 62b6abba7
+  base-date: 2026-06-11 22:28:39 +0200

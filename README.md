@@ -20,9 +20,10 @@ https://mlell.github.io/beanquery.
 
 ## Branch status
 
-Branches that are WIP in this fork:
+Branches that are WIP in this fork. The column 'Merged' is checked
+if the code is merged into the fork (mlell branch):
 
-| Name | Base Commit | Base Date | Merged | Description |
+ Name | Base Commit | Base Date | Merged | Description |
 |------|-------------|-----------|--------|-------------|
 | dev-function-help | `62b6abba7` | 2026-06-11 22:28:39 +0200 | ✓ | Group function help by type |
 | dev-all-lhs | `62b6abba7` | 2026-06-11 22:28:39 +0200 | ✓ | ALL/ANY syntax with inverted operand order |
@@ -30,6 +31,7 @@ Branches that are WIP in this fork:
 | dev-date-cap | `62b6abba7` | 2026-06-11 22:28:39 +0200 | ✓ | Lump dates before/after some point in time |
 | dev-union | `62b6abba7` | 2026-06-11 22:28:39 +0200 | ✓ | SQL UNION support |
 | dev-grouping-sets | `62b6abba7` | 2026-06-11 22:28:39 +0200 | ✓ | SQL GROUPING SETS/ROLLUP/CUBE support |
+| dev-fix-interval | `62b6abba7` | 2026-06-11 22:28:39 +0200 | ✓ | Fix the regex in the BQL function interval() |
 
 ## Branch `dev-union`: UNION queries in BQL
 
